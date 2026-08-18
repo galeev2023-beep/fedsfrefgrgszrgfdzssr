@@ -1,6 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // gl_draw_elements_merged.h — объединённый хук: чамсы + 2D/3D боксы
-// Современный OpenGL, автосканер матрицы (исправленная версия), WorldToScreen
+// Исправления: внутреннее чтение памяти (без ReadProcessMemory),
+// динамический поиск адреса локального игрока.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <windows.h>
@@ -8,12 +9,12 @@
 #include <cmath>
 #include <cstring>
 
-// ── Внешние переключатели ────────────────────────────────────────────────────
+// ── Внешние переключатели (определяются в основном коде чита) ────────────
 extern bool  g_chams_enabled;
 extern bool  g_boxes_enabled;
 extern float g_chams_color[3];
 
-// ── Типы функций OpenGL ─────────────────────────────────────────────────────
+// ── Типы функций OpenGL (из второго файла) ────────────────────────────────
 typedef GLint    (APIENTRY* glGetUniformLocation_fn)(GLuint, const char*);
 typedef void     (APIENTRY* glGetUniformiv_fn)(GLuint, GLint, GLint*);
 typedef void     (APIENTRY* glGetUniformfv_fn)(GLuint, GLint, GLfloat*);
@@ -95,7 +96,7 @@ static void loadGLFuncs() {
     s_funcs_loaded = true;
 }
 
-// ── Box Renderer ─────────────────────────────────────────────────────────────
+// ── Box Renderer (из второго файла) ──────────────────────────────────────
 struct BoxRenderer {
     GLuint prog = 0, vao = 0, vbo = 0;
     bool   ready = false;
@@ -205,18 +206,17 @@ inline bool WorldToScreen(Vector3 targetPos, Vector2& screenPos, uintptr_t matri
     return true;
 }
 
-// ── Динамический Авто-сканер матрицы (ИСПРАВЛЕННАЯ ВЕРСИЯ) ────────────────
+// ── Динамический Авто-сканер матрицы (ВНУТРЕННЯЯ ВЕРСИЯ, БЕЗ ReadProcessMemory) ──
 static uintptr_t DynamicMatrixAddress = 0;
 
 inline void UpdateMatrixAddress(Vector3 myPos)
 {
     // Если адрес уже найден и валиден — не тратим время
-    if (DynamicMatrixAddress != 0 && !IsBadReadPtr((void*)DynamicMatrixAddress, 128)) {
-        return; 
-    }
+    if (DynamicMatrixAddress != 0 && !IsBadReadPtr((void*)DynamicMatrixAddress, 128))
+        return;
 
-    // Сканируем регион 0x200000000–0x300000000
-    uintptr_t start = 0x200000000; 
+    // Сканируем регион 0x200000000–0x300000000 (подберите под свою игру)
+    uintptr_t start = 0x200000000;
     uintptr_t end   = 0x300000000;
     MEMORY_BASIC_INFORMATION mbi;
 
@@ -225,30 +225,82 @@ inline void UpdateMatrixAddress(Vector3 myPos)
             break;
 
         if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize > 0x1000) {
-            std::vector<BYTE> buffer(mbi.RegionSize);
-            SIZE_T bytesRead;
+            uintptr_t regionStart = (uintptr_t)mbi.BaseAddress;
+            uintptr_t regionEnd = regionStart + mbi.RegionSize;
 
-            if (ReadProcessMemory(GetCurrentProcess(), mbi.BaseAddress, buffer.data(), mbi.RegionSize, &bytesRead)) {
-                for (size_t i = 0; i < bytesRead - 0x100; i += 4) {
-                    float* f = (float*)&buffer[i];
-                    
+            // Сканируем напрямую через указатели, с защитой от исключений
+            for (uintptr_t addr = regionStart; addr < regionEnd - 0x100; addr += 4) {
+                __try {
+                    float* f = (float*)addr;
                     // Ищем высоту Y
-                    if (std::abs(*f - myPos.y) < 0.5f)  // *f — это значение Y
-                    {
-                        // Проверяем X (f[-2]) и Z (f[-1]) рядом
+                    if (std::abs(*f - myPos.y) < 0.5f) {
+                        // Проверяем X и Z (порядок в памяти: X, Z, Y)
                         if (std::abs(f[-2] - myPos.x) < 1.0f &&
-                            std::abs(f[-1] - myPos.z) < 1.0f) 
-                        {
-                            // Нашли точку входа в матрицу — смещение 0x70
-                            DynamicMatrixAddress = (uintptr_t)mbi.BaseAddress + i - 0x70;
+                            std::abs(f[-1] - myPos.z) < 1.0f) {
+                            DynamicMatrixAddress = addr - 0x70;
                             return;
                         }
                     }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    // Если чтение вызвало исключение — просто пропускаем этот адрес
+                    continue;
                 }
             }
         }
         start += mbi.RegionSize;
     }
+}
+
+// ── Динамический поиск адреса локального игрока (по координатам) ──────────
+static uintptr_t LocalPlayerAddress = 0;
+
+inline uintptr_t FindLocalPlayerAddress(Vector3& outPos)
+{
+    // Если уже найден и валиден — возвращаем его
+    if (LocalPlayerAddress != 0 && !IsBadReadPtr((void*)LocalPlayerAddress, sizeof(Vector3))) {
+        Vector3 pos = *(Vector3*)LocalPlayerAddress;
+        // Проверяем, что координаты не нулевые (грубая проверка)
+        if (pos.x != 0.0f || pos.y != 0.0f || pos.z != 0.0f) {
+            outPos = pos;
+            return LocalPlayerAddress;
+        }
+    }
+
+    // Сканируем память в поисках структуры с координатами игрока
+    // Используем тот же диапазон, что и для матрицы (можно расширить)
+    uintptr_t start = 0x200000000;
+    uintptr_t end   = 0x300000000;
+    MEMORY_BASIC_INFORMATION mbi;
+
+    while (start < end) {
+        if (VirtualQuery((LPCVOID)start, &mbi, sizeof(mbi)) == 0)
+            break;
+
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize > 0x1000) {
+            uintptr_t regionStart = (uintptr_t)mbi.BaseAddress;
+            uintptr_t regionEnd = regionStart + mbi.RegionSize;
+
+            for (uintptr_t addr = regionStart; addr < regionEnd - sizeof(Vector3); addr += 4) {
+                __try {
+                    Vector3* v = (Vector3*)addr;
+                    // Ищем типичные координаты игрока (например, высота > 0 и < 200)
+                    if (v->y > 0.0f && v->y < 200.0f &&
+                        std::abs(v->x) < 10000.0f && std::abs(v->z) < 10000.0f) {
+                        // Дополнительная проверка: рядом должны лежать не нули
+                        // Можно добавить проверку на целостность структуры
+                        LocalPlayerAddress = addr;
+                        outPos = *v;
+                        return LocalPlayerAddress;
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    continue;
+                }
+            }
+        }
+        start += mbi.RegionSize;
+    }
+    outPos = { 0,0,0 };
+    return 0;
 }
 
 // ── Вспомогательная функция для 3D-бокса текущего объекта ─────────────────
@@ -390,9 +442,9 @@ namespace hooks {
 
             // ── 3. 2D-боксы для всех врагов (через WorldToScreen) ────
             if (g_boxes_enabled) {
-                uintptr_t localPlayerAddress = 0x725DC5424; // замените на актуальный
-                if (localPlayerAddress && !IsBadReadPtr((void*)localPlayerAddress, sizeof(Vector3))) {
-                    Vector3 myPos = *(Vector3*)localPlayerAddress;
+                Vector3 myPos;
+                uintptr_t localAddr = FindLocalPlayerAddress(myPos);
+                if (localAddr) {
                     UpdateMatrixAddress(myPos);
 
                     if (DynamicMatrixAddress) {
