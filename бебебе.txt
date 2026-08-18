@@ -1,7 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // gl_draw_elements_merged.h — объединённый хук: чамсы + 2D/3D боксы
-// Исправления: внутреннее чтение памяти (без ReadProcessMemory),
-// динамический поиск адреса локального игрока.
+// Обновление: допуски и сдвиг в UpdateMatrixAddress согласно вашим замерам.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <windows.h>
@@ -9,12 +8,12 @@
 #include <cmath>
 #include <cstring>
 
-// ── Внешние переключатели (определяются в основном коде чита) ────────────
+// ── Внешние переключатели ────────────────────────────────────────────────────
 extern bool  g_chams_enabled;
 extern bool  g_boxes_enabled;
 extern float g_chams_color[3];
 
-// ── Типы функций OpenGL (из второго файла) ────────────────────────────────
+// ── Типы функций OpenGL ─────────────────────────────────────────────────────
 typedef GLint    (APIENTRY* glGetUniformLocation_fn)(GLuint, const char*);
 typedef void     (APIENTRY* glGetUniformiv_fn)(GLuint, GLint, GLint*);
 typedef void     (APIENTRY* glGetUniformfv_fn)(GLuint, GLint, GLfloat*);
@@ -96,7 +95,7 @@ static void loadGLFuncs() {
     s_funcs_loaded = true;
 }
 
-// ── Box Renderer (из второго файла) ──────────────────────────────────────
+// ── Box Renderer ─────────────────────────────────────────────────────────────
 struct BoxRenderer {
     GLuint prog = 0, vao = 0, vbo = 0;
     bool   ready = false;
@@ -206,7 +205,7 @@ inline bool WorldToScreen(Vector3 targetPos, Vector2& screenPos, uintptr_t matri
     return true;
 }
 
-// ── Динамический Авто-сканер матрицы (ВНУТРЕННЯЯ ВЕРСИЯ, БЕЗ ReadProcessMemory) ──
+// ── Динамический Авто-сканер матрицы (исправленная версия с вашими правками) ──
 static uintptr_t DynamicMatrixAddress = 0;
 
 inline void UpdateMatrixAddress(Vector3 myPos)
@@ -228,21 +227,20 @@ inline void UpdateMatrixAddress(Vector3 myPos)
             uintptr_t regionStart = (uintptr_t)mbi.BaseAddress;
             uintptr_t regionEnd = regionStart + mbi.RegionSize;
 
-            // Сканируем напрямую через указатели, с защитой от исключений
+            // Сканируем напрямую через указатели с защитой от исключений
             for (uintptr_t addr = regionStart; addr < regionEnd - 0x100; addr += 4) {
                 __try {
                     float* f = (float*)addr;
-                    // Ищем высоту Y
-                    if (std::abs(*f - myPos.y) < 0.5f) {
-                        // Проверяем X и Z (порядок в памяти: X, Z, Y)
-                        if (std::abs(f[-2] - myPos.x) < 1.0f &&
-                            std::abs(f[-1] - myPos.z) < 1.0f) {
-                            DynamicMatrixAddress = addr - 0x70;
+                    // 1. Увеличили допуск по Y до 1.0f
+                    if (std::abs(*f - myPos.y) < 1.0f) {
+                        // 2. Допуск X/Z увеличен до 5.0f для стабильности
+                        if (std::abs(f[-2] - myPos.x) < 5.0f && std::abs(f[-1] - myPos.z) < 5.0f) {
+                            // 3. Сдвиг исправлен на точный 0x16A
+                            DynamicMatrixAddress = addr - 0x16A;
                             return;
                         }
                     }
                 } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    // Если чтение вызвало исключение — просто пропускаем этот адрес
                     continue;
                 }
             }
@@ -267,7 +265,6 @@ inline uintptr_t FindLocalPlayerAddress(Vector3& outPos)
     }
 
     // Сканируем память в поисках структуры с координатами игрока
-    // Используем тот же диапазон, что и для матрицы (можно расширить)
     uintptr_t start = 0x200000000;
     uintptr_t end   = 0x300000000;
     MEMORY_BASIC_INFORMATION mbi;
@@ -286,8 +283,6 @@ inline uintptr_t FindLocalPlayerAddress(Vector3& outPos)
                     // Ищем типичные координаты игрока (например, высота > 0 и < 200)
                     if (v->y > 0.0f && v->y < 200.0f &&
                         std::abs(v->x) < 10000.0f && std::abs(v->z) < 10000.0f) {
-                        // Дополнительная проверка: рядом должны лежать не нули
-                        // Можно добавить проверку на целостность структуры
                         LocalPlayerAddress = addr;
                         outPos = *v;
                         return LocalPlayerAddress;
