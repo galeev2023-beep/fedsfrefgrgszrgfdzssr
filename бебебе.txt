@@ -1,9 +1,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // gl_draw_elements_merged.h — чамсы + 3D-бокс для текущего игрока
-// Инициализация рендерера вынесена в глобальный конструктор (выполняется 1 раз)
+// Инициализация рендерера выполняется при первом вызове хука, но ТОЛЬКО
+// при наличии активного OpenGL-контекста (wglGetCurrentContext != NULL).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #pragma comment(lib, "opengl32.lib")
+#pragma comment(lib, "gdi32.lib")   // для wglGetCurrentContext
 
 #include <windows.h>
 #include <vector>
@@ -14,7 +16,6 @@
 typedef ptrdiff_t GLsizeiptr;
 #endif
 
-// ── Внешние переключатели ────────────────────────────────────────────────────
 extern bool  g_chams_enabled;
 extern bool  g_boxes_enabled;
 extern float g_chams_color[3];
@@ -105,19 +106,25 @@ static void loadGLFuncs() {
 }
 
 // ============================================================================
-//  БЛОК 2: BoxRenderer – инициализируется один раз в глобальном конструкторе
+//  БЛОК 2: BoxRenderer – отложенная инициализация (только при активном контексте)
 // ============================================================================
 
 struct BoxRenderer {
     GLuint prog = 0, vao = 0, vbo = 0;
     bool   ready = false;
 
-    void init() {
-        if (ready) return;
+    bool init() {
+        if (ready) return true;
+        // Проверяем, что контекст OpenGL активен
+        if (!wglGetCurrentContext()) {
+            return false; // контекст ещё не создан – пропускаем
+        }
+        // Загружаем функции, если ещё не загружены
         if (!_glCreateShader) {
-            // Если функции не загружены – загружаем
             loadGLFuncs();
-            if (!_glCreateShader) return;
+        }
+        if (!_glCreateShader) {
+            return false; // не удалось загрузить функции
         }
 
         const char* vs = R"(
@@ -139,19 +146,19 @@ void main(){ c = u_color; })";
         GLuint v = _glCreateShader(GL_VERTEX_SHADER);
         _glShaderSource(v, 1, &vs, nullptr); _glCompileShader(v);
         GLint ok; _glGetShaderiv(v, GL_COMPILE_STATUS, &ok);
-        if (!ok) { _glDeleteShader(v); return; }
+        if (!ok) { _glDeleteShader(v); return false; }
 
         GLuint f = _glCreateShader(GL_FRAGMENT_SHADER);
         _glShaderSource(f, 1, &fs, nullptr); _glCompileShader(f);
         _glGetShaderiv(f, GL_COMPILE_STATUS, &ok);
-        if (!ok) { _glDeleteShader(v); _glDeleteShader(f); return; }
+        if (!ok) { _glDeleteShader(v); _glDeleteShader(f); return false; }
 
         prog = _glCreateProgram();
         _glAttachShader(prog, v); _glAttachShader(prog, f);
         _glLinkProgram(prog);
         _glGetProgramiv(prog, GL_LINK_STATUS, &ok);
         _glDeleteShader(v); _glDeleteShader(f);
-        if (!ok) return;
+        if (!ok) return false;
 
         float verts[] = { 0,0, 1,0, 1,1, 0,1 };
         _glGenVertexArrays(1, &vao); _glGenBuffers(1, &vbo);
@@ -162,6 +169,7 @@ void main(){ c = u_color; })";
         _glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, (void*)0);
         _glBindVertexArray(0);
         ready = true;
+        return true;
     }
 
     void draw(float x, float y, float w, float h, float r, float g, float b) {
@@ -192,17 +200,16 @@ void main(){ c = u_color; })";
 static BoxRenderer g_box;
 
 // ============================================================================
-//  ГЛОБАЛЬНЫЙ ИНИЦИАЛИЗАТОР – вызывается один раз при загрузке DLL
+//  БЕЗОПАСНАЯ ИНИЦИАЛИЗАЦИЯ (вызывается из хука)
 // ============================================================================
-static struct InitRenderer {
-    InitRenderer() {
-        loadGLFuncs();   // загружаем OpenGL-функции
-        g_box.init();    // создаём шейдеры и буферы ОДИН РАЗ
-    }
-} init_renderer;         // этот объект создаётся до вызова любых хуков
+
+static bool ensure_renderer_initialized() {
+    if (g_box.ready) return true;
+    return g_box.init();
+}
 
 // ============================================================================
-//  БЛОК 3: getScreenBounds – 3D-бокс через матрицы OpenGL
+//  БЛОК 3: getScreenBounds
 // ============================================================================
 
 static bool getScreenBounds(float& ox, float& oy, float& ow, float& oh) {
@@ -236,7 +243,7 @@ static bool getScreenBounds(float& ox, float& oy, float& ow, float& oh) {
 }
 
 // ============================================================================
-//  БЛОК 4: WorldToScreen и автосканер (опционально, не используются)
+//  БЛОК 4: WorldToScreen и автосканер (опционально)
 // ============================================================================
 
 struct Vector3 { float x, y, z; };
@@ -350,18 +357,25 @@ inline uintptr_t FindLocalPlayerAddress(Vector3& outPos)
 }
 
 // ============================================================================
-//  БЛОК 5: ОСНОВНОЙ ХУК (инициализация уже выполнена, вызываем только отрисовку)
+//  БЛОК 5: ОСНОВНОЙ ХУК (с безопасной инициализацией)
 // ============================================================================
 
 namespace hooks {
     namespace handles {
-        // Указатель на оригинальную функцию – должен быть установлен извне
         void (*originals_gl_draw_elements)(GLenum, GLsizei, GLenum, const void*) = nullptr;
 
         VOID WINAPI gl_draw_elements(GLenum mode, GLsizei count, GLenum type, const void* indices)
         {
             // Если чамсы выключены – сразу передаём дальше
             if (!g_chams_enabled) {
+                if (originals_gl_draw_elements)
+                    originals_gl_draw_elements(mode, count, type, indices);
+                return;
+            }
+
+            // *** БЕЗОПАСНАЯ ИНИЦИАЛИЗАЦИЯ (только если контекст активен) ***
+            if (!ensure_renderer_initialized()) {
+                // Если не удалось инициализировать – всё равно рисуем оригинал
                 if (originals_gl_draw_elements)
                     originals_gl_draw_elements(mode, count, type, indices);
                 return;
