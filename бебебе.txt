@@ -1,27 +1,26 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // gl_draw_elements_merged.h — чамсы + 3D-бокс для текущего игрока
-// Исправления: подключена библиотека opengl32.lib, определён originals_gl_draw_elements
+// Инициализация рендерера вынесена в глобальный конструктор (выполняется 1 раз)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#pragma comment(lib, "opengl32.lib")   // <-- Решает проблемы с LNK2019
+#pragma comment(lib, "opengl32.lib")
 
 #include <windows.h>
 #include <vector>
 #include <cmath>
 #include <cstring>
 
-// Если GLsizeiptr не определён (например, при отсутствии <GL/gl.h>)
 #ifndef GLsizeiptr
 typedef ptrdiff_t GLsizeiptr;
 #endif
 
-// ── Внешние переключатели (определяются в основном коде чита) ────────────
+// ── Внешние переключатели ────────────────────────────────────────────────────
 extern bool  g_chams_enabled;
 extern bool  g_boxes_enabled;
 extern float g_chams_color[3];
 
 // ============================================================================
-//  БЛОК 1: ВСЕ ТИПЫ И ФУНКЦИИ OPENGL
+//  БЛОК 1: Типы и загрузка OpenGL-функций
 // ============================================================================
 
 typedef GLint    (APIENTRY* glGetUniformLocation_fn)(GLuint, const char*);
@@ -106,7 +105,7 @@ static void loadGLFuncs() {
 }
 
 // ============================================================================
-//  БЛОК 2: BoxRenderer (рисует 2D-боксы через шейдер)
+//  БЛОК 2: BoxRenderer – инициализируется один раз в глобальном конструкторе
 // ============================================================================
 
 struct BoxRenderer {
@@ -115,7 +114,11 @@ struct BoxRenderer {
 
     void init() {
         if (ready) return;
-        if (!_glCreateShader) return;
+        if (!_glCreateShader) {
+            // Если функции не загружены – загружаем
+            loadGLFuncs();
+            if (!_glCreateShader) return;
+        }
 
         const char* vs = R"(
 #version 330 core
@@ -189,7 +192,17 @@ void main(){ c = u_color; })";
 static BoxRenderer g_box;
 
 // ============================================================================
-//  БЛОК 3: getScreenBounds (рисование 3D-бокса через матрицы OpenGL)
+//  ГЛОБАЛЬНЫЙ ИНИЦИАЛИЗАТОР – вызывается один раз при загрузке DLL
+// ============================================================================
+static struct InitRenderer {
+    InitRenderer() {
+        loadGLFuncs();   // загружаем OpenGL-функции
+        g_box.init();    // создаём шейдеры и буферы ОДИН РАЗ
+    }
+} init_renderer;         // этот объект создаётся до вызова любых хуков
+
+// ============================================================================
+//  БЛОК 3: getScreenBounds – 3D-бокс через матрицы OpenGL
 // ============================================================================
 
 static bool getScreenBounds(float& ox, float& oy, float& ow, float& oh) {
@@ -223,7 +236,7 @@ static bool getScreenBounds(float& ox, float& oy, float& ow, float& oh) {
 }
 
 // ============================================================================
-//  БЛОК 4: WorldToScreen и автосканер матрицы (опционально, не используются)
+//  БЛОК 4: WorldToScreen и автосканер (опционально, не используются)
 // ============================================================================
 
 struct Vector3 { float x, y, z; };
@@ -337,161 +350,133 @@ inline uintptr_t FindLocalPlayerAddress(Vector3& outPos)
 }
 
 // ============================================================================
-//  БЛОК 5: ОПРЕДЕЛЯЕМ УКАЗАТЕЛЬ НА ОРИГИНАЛЬНУЮ ФУНКЦИЮ (чтобы избежать LNK2001)
+//  БЛОК 5: ОСНОВНОЙ ХУК (инициализация уже выполнена, вызываем только отрисовку)
 // ============================================================================
 
 namespace hooks {
     namespace handles {
-        // Определение указателя – теперь он не extern, а обычная глобальная переменная
+        // Указатель на оригинальную функцию – должен быть установлен извне
         void (*originals_gl_draw_elements)(GLenum, GLsizei, GLenum, const void*) = nullptr;
 
-        // ОСНОВНОЙ ХУК
         VOID WINAPI gl_draw_elements(GLenum mode, GLsizei count, GLenum type, const void* indices)
         {
-            loadGLFuncs();
+            // Если чамсы выключены – сразу передаём дальше
+            if (!g_chams_enabled) {
+                if (originals_gl_draw_elements)
+                    originals_gl_draw_elements(mode, count, type, indices);
+                return;
+            }
 
-            if (g_chams_enabled) {
-                GLint cur_prog;
-                glGetIntegerv(GL_CURRENT_PROGRAM, &cur_prog);
-                if (cur_prog) {
-                    GLint loc_anim  = _glGetUniformLocation(cur_prog, "isAnimated");
-                    GLint loc_emit  = _glGetUniformLocation(cur_prog, "emissionColor");
-                    GLint loc_diff  = _glGetUniformLocation(cur_prog, "diffuseColor");
-                    GLint loc_spec  = _glGetUniformLocation(cur_prog, "specularColor");
-                    GLint loc_light = _glGetUniformLocation(cur_prog, "g_LightSunColor");
-                    GLint loc_bones = _glGetUniformLocation(cur_prog, "boneMatrices");
+            GLint cur_prog;
+            glGetIntegerv(GL_CURRENT_PROGRAM, &cur_prog);
+            if (!cur_prog) {
+                if (originals_gl_draw_elements)
+                    originals_gl_draw_elements(mode, count, type, indices);
+                return;
+            }
 
-                    bool is_player = (loc_anim!=-1 && loc_emit!=-1 && loc_diff!=-1 && loc_spec!=-1 && loc_light!=-1)
-                                  || (loc_bones!=-1);
+            GLint loc_anim  = _glGetUniformLocation(cur_prog, "isAnimated");
+            GLint loc_emit  = _glGetUniformLocation(cur_prog, "emissionColor");
+            GLint loc_diff  = _glGetUniformLocation(cur_prog, "diffuseColor");
+            GLint loc_spec  = _glGetUniformLocation(cur_prog, "specularColor");
+            GLint loc_light = _glGetUniformLocation(cur_prog, "g_LightSunColor");
+            GLint loc_bones = _glGetUniformLocation(cur_prog, "boneMatrices");
 
-                    if (is_player) {
-                        // Бекап
-                        GLfloat bk_em[3],bk_di[3],bk_sp[3],bk_li[3],bk_dr[2],bk_bc[4];
-                        GLint bk_df,bk_bs,bk_bd;
-                        GLboolean bk_bl=glIsEnabled(GL_BLEND), bk_dt=glIsEnabled(GL_DEPTH_TEST);
-                        glGetFloatv(GL_BLEND_COLOR,bk_bc); glGetIntegerv(GL_BLEND_SRC,&bk_bs); glGetIntegerv(GL_BLEND_DST,&bk_bd);
-                        glGetFloatv(GL_DEPTH_RANGE,bk_dr); glGetIntegerv(GL_DEPTH_FUNC,&bk_df);
+            bool is_player = (loc_anim!=-1 && loc_emit!=-1 && loc_diff!=-1 && loc_spec!=-1 && loc_light!=-1)
+                          || (loc_bones!=-1);
 
-                        bool has_col = (loc_emit!=-1);
-                        if (has_col) {
-                            _glGetUniformfv(cur_prog,loc_emit,bk_em); _glGetUniformfv(cur_prog,loc_diff,bk_di);
-                            _glGetUniformfv(cur_prog,loc_spec,bk_sp); _glGetUniformfv(cur_prog,loc_light,bk_li);
-                        }
+            if (!is_player) {
+                if (originals_gl_draw_elements)
+                    originals_gl_draw_elements(mode, count, type, indices);
+                return;
+            }
 
-                        // Текстуры
-                        const int NT=16;
-                        GLint  ss[NT]; memset(ss,-1,sizeof(ss));
-                        GLuint st[NT]; memset(st, 0,sizeof(st));
-                        static GLuint flat_tex=0;
-                        if (!flat_tex) glGenTextures(1,&flat_tex);
+            // Бекап состояний OpenGL
+            GLfloat bk_em[3], bk_di[3], bk_sp[3], bk_li[3], bk_dr[2], bk_bc[4];
+            GLint bk_df, bk_bs, bk_bd;
+            GLboolean bk_bl = glIsEnabled(GL_BLEND), bk_dt = glIsEnabled(GL_DEPTH_TEST);
+            glGetFloatv(GL_BLEND_COLOR, bk_bc);
+            glGetIntegerv(GL_BLEND_SRC, &bk_bs);
+            glGetIntegerv(GL_BLEND_DST, &bk_bd);
+            glGetFloatv(GL_DEPTH_RANGE, bk_dr);
+            glGetIntegerv(GL_DEPTH_FUNC, &bk_df);
 
-                        for (int i=0;i<NT;i++) {
-                            char nm[32]; sprintf_s(nm,"usedTextures[%d]",i);
-                            GLint loc=_glGetUniformLocation(cur_prog,nm); if(loc==-1) continue;
-                            GLint smp; _glGetUniformiv(cur_prog,loc,&smp);
-                            _glActiveTexture(GL_TEXTURE0+smp);
-                            GLint bt; glGetIntegerv(GL_TEXTURE_BINDING_2D,&bt);
-                            ss[i]=smp; st[i]=(GLuint)bt;
-                            unsigned char px[4]={(unsigned char)(g_chams_color[0]*255),
-                                                 (unsigned char)(g_chams_color[1]*255),
-                                                 (unsigned char)(g_chams_color[2]*255),255};
-                            glBindTexture(GL_TEXTURE_2D,flat_tex);
-                            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,px);
-                        }
+            bool has_col = (loc_emit != -1);
+            if (has_col) {
+                _glGetUniformfv(cur_prog, loc_emit, bk_em);
+                _glGetUniformfv(cur_prog, loc_diff, bk_di);
+                _glGetUniformfv(cur_prog, loc_spec, bk_sp);
+                _glGetUniformfv(cur_prog, loc_light, bk_li);
+            }
 
-                        glEnable(GL_BLEND); glBlendFunc(GL_ONE,GL_CONSTANT_COLOR);
-                        _glBlendColor(g_chams_color[0],g_chams_color[1],g_chams_color[2],1.f);
-                        if (has_col) {
-                            _glUniform3f(loc_emit, g_chams_color[0],g_chams_color[1],g_chams_color[2]);
-                            _glUniform3f(loc_diff, g_chams_color[0],g_chams_color[1],g_chams_color[2]);
-                            _glUniform3f(loc_spec, g_chams_color[0],g_chams_color[1],g_chams_color[2]);
-                            _glUniform3f(loc_light,g_chams_color[0],g_chams_color[1],g_chams_color[2]);
-                        }
-                        glDepthRange(0.0,0.0);
+            // Подмена текстур на одноцветную
+            const int NT = 16;
+            GLint  ss[NT]; memset(ss, -1, sizeof(ss));
+            GLuint st[NT]; memset(st, 0, sizeof(st));
+            static GLuint flat_tex = 0;
+            if (!flat_tex) glGenTextures(1, &flat_tex);
 
-                        // Отрисовка модели с чамсами
-                        originals_gl_draw_elements(mode,count,type,indices);
+            for (int i = 0; i < NT; i++) {
+                char nm[32]; sprintf_s(nm, "usedTextures[%d]", i);
+                GLint loc = _glGetUniformLocation(cur_prog, nm);
+                if (loc == -1) continue;
+                GLint smp; _glGetUniformiv(cur_prog, loc, &smp);
+                _glActiveTexture(GL_TEXTURE0 + smp);
+                GLint bt; glGetIntegerv(GL_TEXTURE_BINDING_2D, &bt);
+                ss[i] = smp; st[i] = (GLuint)bt;
+                unsigned char px[4] = {
+                    (unsigned char)(g_chams_color[0] * 255),
+                    (unsigned char)(g_chams_color[1] * 255),
+                    (unsigned char)(g_chams_color[2] * 255),
+                    255
+                };
+                glBindTexture(GL_TEXTURE_2D, flat_tex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            }
 
-                        // Бокс для текущего игрока (без списков)
-                        if (g_boxes_enabled) {
-                            g_box.init();
-                            float bx,by,bw,bh;
-                            if (getScreenBounds(bx,by,bw,bh)) {
-                                g_box.draw(bx,by,bw,bh,
-                                           g_chams_color[0], g_chams_color[1], g_chams_color[2]);
-                            }
-                        }
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_ONE, GL_CONSTANT_COLOR);
+            _glBlendColor(g_chams_color[0], g_chams_color[1], g_chams_color[2], 1.f);
+            if (has_col) {
+                _glUniform3f(loc_emit, g_chams_color[0], g_chams_color[1], g_chams_color[2]);
+                _glUniform3f(loc_diff, g_chams_color[0], g_chams_color[1], g_chams_color[2]);
+                _glUniform3f(loc_spec, g_chams_color[0], g_chams_color[1], g_chams_color[2]);
+                _glUniform3f(loc_light, g_chams_color[0], g_chams_color[1], g_chams_color[2]);
+            }
+            glDepthRange(0.0, 0.0);
 
-                        // Восстановление
-                        if (has_col) {
-                            _glUniform3f(loc_emit, bk_em[0],bk_em[1],bk_em[2]);
-                            _glUniform3f(loc_diff, bk_di[0],bk_di[1],bk_di[2]);
-                            _glUniform3f(loc_spec, bk_sp[0],bk_sp[1],bk_sp[2]);
-                            _glUniform3f(loc_light,bk_li[0],bk_li[1],bk_li[2]);
-                        }
-                        glDepthRange(bk_dr[0],bk_dr[1]); glDepthFunc(bk_df);
-                        if (bk_bl) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-                        if (bk_dt) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-                        _glBlendColor(bk_bc[0],bk_bc[1],bk_bc[2],bk_bc[3]);
-                        glBlendFunc(bk_bs,bk_bd);
-                        for (int i=0;i<NT;i++) {
-                            if (ss[i]==-1) continue;
-                            _glActiveTexture(GL_TEXTURE0+ss[i]);
-                            glBindTexture(GL_TEXTURE_2D,st[i]);
-                        }
-                    } else {
-                        originals_gl_draw_elements(mode,count,type,indices);
-                    }
-                } else {
-                    originals_gl_draw_elements(mode,count,type,indices);
+            // Рисуем модель с чамсами
+            if (originals_gl_draw_elements)
+                originals_gl_draw_elements(mode, count, type, indices);
+
+            // Рисуем 3D-бокс (инициализация уже выполнена)
+            if (g_boxes_enabled) {
+                float bx, by, bw, bh;
+                if (getScreenBounds(bx, by, bw, bh)) {
+                    g_box.draw(bx, by, bw, bh,
+                               g_chams_color[0], g_chams_color[1], g_chams_color[2]);
                 }
-            } else {
-                originals_gl_draw_elements(mode,count,type,indices);
+            }
+
+            // Восстанавливаем состояния
+            if (has_col) {
+                _glUniform3f(loc_emit, bk_em[0], bk_em[1], bk_em[2]);
+                _glUniform3f(loc_diff, bk_di[0], bk_di[1], bk_di[2]);
+                _glUniform3f(loc_spec, bk_sp[0], bk_sp[1], bk_sp[2]);
+                _glUniform3f(loc_light, bk_li[0], bk_li[1], bk_li[2]);
+            }
+            glDepthRange(bk_dr[0], bk_dr[1]);
+            glDepthFunc(bk_df);
+            if (bk_bl) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+            if (bk_dt) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+            _glBlendColor(bk_bc[0], bk_bc[1], bk_bc[2], bk_bc[3]);
+            glBlendFunc(bk_bs, bk_bd);
+
+            for (int i = 0; i < NT; i++) {
+                if (ss[i] == -1) continue;
+                _glActiveTexture(GL_TEXTURE0 + ss[i]);
+                glBindTexture(GL_TEXTURE_2D, st[i]);
             }
         }
     }
-} 
-и 
-#include "hooks/hooks.hpp"
-#include <windows.h>
-
-// ── Глобальные настройки ──────────────────────────────────────────────────────
-bool  g_chams_enabled = true;
-bool  g_boxes_enabled = true;
-float g_chams_color[3] = { 1.f, 0.f, 0.f }; // красный по умолчанию
-
-// Горячие клавиши:
-// INSERT — вкл/выкл чамсы
-// F1 — красный | F2 — зелёный | F3 — синий | F4 — белый
-// F5 — вкл/выкл 3D боксы
-
-static DWORD WINAPI hotkeysThread(LPVOID) {
-    bool wasInsert=false, wasF1=false, wasF2=false, wasF3=false, wasF4=false, wasF5=false;
-    while (true) {
-        Sleep(50);
-        #define CHECK(key, was, action) { bool now=(GetAsyncKeyState(key)&0x8000)!=0; if(now&&!was){action;} was=now; }
-        CHECK(VK_INSERT, wasInsert, g_chams_enabled = !g_chams_enabled)
-        CHECK(VK_F1, wasF1, (g_chams_color[0]=1,g_chams_color[1]=0,g_chams_color[2]=0))
-        CHECK(VK_F2, wasF2, (g_chams_color[0]=0,g_chams_color[1]=1,g_chams_color[2]=0))
-        CHECK(VK_F3, wasF3, (g_chams_color[0]=0,g_chams_color[1]=0,g_chams_color[2]=1))
-        CHECK(VK_F4, wasF4, (g_chams_color[0]=1,g_chams_color[1]=1,g_chams_color[2]=1))
-        CHECK(VK_F5, wasF5, g_boxes_enabled = !g_boxes_enabled)
-        #undef CHECK
-    }
-    return 0;
-}
-
-BOOL APIENTRY DllMain(HMODULE handle_module, DWORD ul_reason_for_call, LPVOID reserved)
-{
-    switch (ul_reason_for_call)
-    {
-        case DLL_PROCESS_ATTACH:
-        {
-            DisableThreadLibraryCalls(handle_module);
-            hooks::initialize();
-            CreateThread(nullptr, 0, hotkeysThread, nullptr, 0, nullptr);
-            break;
-        }
-    }
-    return TRUE;
 }
