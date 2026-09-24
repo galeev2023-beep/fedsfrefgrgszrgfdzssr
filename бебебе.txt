@@ -1,6 +1,3 @@
-Готово. Ниже полный `hooks.cpp` — внутренности `if (isReady)` заменены на прямой запрос матриц через `glGetFloatv`, UBO и `persistentBlock` больше не используются.
-
-```cpp
 #include <Windows.h>
 #include <string>
 #include <iostream>
@@ -34,65 +31,119 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
     // Трава, листья, декали — меньше. mode == 4 — это GL_TRIANGLES.
     bool isReady = (count >= 1000 && count <= 150000) && (mode == 4);
 
-    // Проверку ширины текстуры и uniformCount отключили ранее — оставляем как есть.
+    GLint currentProgram = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
 
     if (isReady) {
-        // --- 2. Прямой запрос матриц через fixed-function API ---
-        // Никаких UBO, никаких persistentBlock, никаких юниформов.
-        // Драйвер сам отдаст то, что накопилось в матричных стеках.
-        GLfloat modelViewRaw[16] = { 0 };
-        GLfloat projectionRaw[16] = { 0 };
+        glm::mat4 modelMatrix{ 0 };
+        glm::mat4 viewMatrix{ 0 };
+        glm::mat4 projectionMatrix{ 0 };
 
-        glGetFloatv(GL_MODELVIEW_MATRIX, modelViewRaw);
-        glGetFloatv(GL_PROJECTION_MATRIX, projectionRaw);
+        bool gotModelMatrix = false;
+        bool gotViewProjection = false;
 
-        glm::mat4 modelView = glm::make_mat4(modelViewRaw);
-        glm::mat4 projection = glm::make_mat4(projectionRaw);
+        // --- 2. modelMatrix через юниформ ---
+        if (currentProgram != 0) {
+            GLint modelMatrixLocation = glGetUniformLocation(currentProgram, "modelMatrix");
+            if (modelMatrixLocation != -1) {
+                glGetUniformfv(currentProgram, modelMatrixLocation, glm::value_ptr(modelMatrix));
+                gotModelMatrix = true;
+            }
+        }
 
-        // --- 3. Минимальные санити-проверки ---
-        // Пустая/нулевая матрица — данные ещё не готовы, ждём следующий вызов.
-        if (modelView == glm::mat4(0.0f) || projection == glm::mat4(0.0f)) {
+        // --- 3. viewMatrix / projectionMatrix через UBO ---
+        // Основной путь для шейдерного пайплайна Сталзона.
+        if (currentProgram != 0) {
+            GLuint blockIndexPersist = glGetUniformBlockIndex(currentProgram, "persistentBlock");
+            if (blockIndexPersist != GL_INVALID_INDEX) {
+                GLint bindingPoint = 0;
+                glGetActiveUniformBlockiv(currentProgram, blockIndexPersist,
+                                          GL_UNIFORM_BLOCK_BINDING, &bindingPoint);
+
+                GLint gameUbo = 0;
+                glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, bindingPoint, &gameUbo);
+
+                if (gameUbo != 0) {
+                    // Сохраняем текущую привязку, чтобы вернуть её после чтения.
+                    GLint previousUBO = 0;
+                    glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &previousUBO);
+
+                    glBindBuffer(GL_UNIFORM_BUFFER, gameUbo);
+                    glGetBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(glm::mat4),
+                                       glm::value_ptr(viewMatrix));
+                    glGetBufferSubData(GL_UNIFORM_BUFFER, sizeof(glm::mat4), sizeof(glm::mat4),
+                                       glm::value_ptr(projectionMatrix));
+                    glBindBuffer(GL_UNIFORM_BUFFER, previousUBO);
+
+                    // Если UBO реально вернул ненулевые матрицы — считаем успех.
+                    if (viewMatrix != glm::mat4(0.0f) && projectionMatrix != glm::mat4(0.0f)) {
+                        gotViewProjection = true;
+                    }
+                }
+            }
+        }
+
+        // --- 4. Fallback через glGetFloatv ---
+        // Если UBO не сработал — пробуем fixed-function стек.
+        // На чисто шейдерном пайплайне вернёт identity, и мы отсеем по identity-проверке.
+        if (!gotViewProjection) {
+            GLfloat mvRaw[16] = { 0 };
+            GLfloat pjRaw[16] = { 0 };
+            glGetFloatv(GL_MODELVIEW_MATRIX, mvRaw);
+            glGetFloatv(GL_PROJECTION_MATRIX, pjRaw);
+
+            glm::mat4 mv = glm::make_mat4(mvRaw);
+            glm::mat4 pj = glm::make_mat4(pjRaw);
+
+            if (mv != glm::mat4(0.0f) && pj != glm::mat4(0.0f) &&
+                mv != glm::mat4(1.0f) && pj != glm::mat4(1.0f)) {
+                viewMatrix = mv;
+                projectionMatrix = pj;
+                gotViewProjection = true;
+                // modelMatrix отсутствует в этом пути — используем identity,
+                // потому что GL_MODELVIEW_MATRIX уже содержит view * model.
+                if (!gotModelMatrix) {
+                    modelMatrix = glm::mat4(1.0f);
+                    gotModelMatrix = true;
+                }
+            }
+        }
+
+        if (!gotModelMatrix || !gotViewProjection) {
             goto THE_END;
         }
 
-        // Если матрица — идеальная единичная (identity), это значит, что игра
-        // использует шейдеры с UBO и fixed-function стек не заполняется.
-        // Проецировать нечего — уходим.
-        if (modelView == glm::mat4(1.0f) || projection == glm::mat4(1.0f)) {
+        // --- 5. Санити-проверки ---
+        // Убрали projectionMatrix[3][3] != 0.0f — она ломала всё на Reversed-Z
+        // и Ortho-проекциях (в современном Сталзоне там 1.0).
+        if (modelMatrix == glm::mat4(0.0f) ||
+            viewMatrix == glm::mat4(0.0f) ||
+            projectionMatrix == glm::mat4(0.0f)) {
             goto THE_END;
         }
 
-        // --- 4. Проекция точки мира в экранные координаты ---
-        // В fixed-function pipeline GL_MODELVIEW_MATRIX уже содержит view * model,
-        // то есть трансформацию от мировой точки к камере. Поэтому worldPos —
-        // это координаты объекта в мировом пространстве.
-        //
-        // Проблема: у нас нет отдельной модельной матрицы на каждый объект, поэтому
-        // единственная известная точка — начало координат модели, которое после
-        // умножения на modelView даст позицию (0,0,0) в view-space. Это НЕ позиция
-        // игрока, а позиция, которую текущая матрица считает "локальным нулём".
-        //
-        // Для игр, которые всё ещё грузят матрицу объекта напрямую через glLoadMatrix
-        // перед glDrawElements, этот способ даёт правильные координаты. Для чисто
-        // шейдерных пайплайнов — см. предупреждения ниже.
+        // --- 6. Расчёт экранных координат ---
+        glm::vec4 worldPos = glm::vec4(modelMatrix[3][0],
+                                       modelMatrix[3][1],
+                                       modelMatrix[3][2],
+                                       modelMatrix[3][3]);
 
-        glm::vec4 worldPos(0.0f, 0.0f, 0.0f, 1.0f);
+        // Если modelMatrix == identity (fallback-путь), worldPos = (0,0,0,1).
+        // Это даст точку в центре камеры, что для шейдерного пайплайна неверно,
+        // но fallback и не должен срабатывать в норме. Оставлено как страховка.
+        float headHeight = 1.65f; // points at the legs, so I decided to lift it for aimbot
+        worldPos.y += headHeight;
 
-        // Подъём на высоту головы для аимбота — если игра всё ещё fixed-function,
-        // позиция модели обычно у ног.
-        worldPos.y += 1.65f;
+        glm::vec4 viewPosition = viewMatrix * worldPos;
+        glm::vec4 clipPosition = projectionMatrix * viewPosition;
 
-        glm::vec4 viewPos = modelView * worldPos;
-        glm::vec4 clipPos = projection * viewPos;
+        if (clipPosition.w == 0.0f) goto THE_END;
 
-        if (clipPos.w == 0.0f) goto THE_END;
+        glm::vec4 ndcPosition = clipPosition / clipPosition.w;
 
-        glm::vec4 ndc = clipPos / clipPos.w;
+        float screenX = (ndcPosition.x + 1.0f) / 2.0f * options::monitorX;
+        float screenY = (1.0f - ndcPosition.y) / 2.0f * options::monitorY;
 
-        float screenX = (ndc.x + 1.0f) / 2.0f * options::monitorX;
-        float screenY = (1.0f - ndc.y) / 2.0f * options::monitorY;
-
-        // Отсекаем всё, что за пределами экрана.
         if (screenX < options::monitorX && screenX > 0.0f &&
             screenY > 0.0f && screenY < options::monitorY) {
             coordsArray.push_back({ screenX, screenY });
@@ -113,65 +164,3 @@ void WINAPI Hooks::hk_glFlush() {
 
     fn_glFlush();
 }
-```
-
----
-
-### Что теперь происходит
-
-Вместо:
-- чтения `isAnimated`,
-- получения `modelMatrix` через `glGetUniformfv`,
-- поиска `persistentBlock` и `glGetActiveUniformBlockiv`,
-- чтения из UBO через `glGetBufferSubData`,
-
-код делает два простых вызова:
-```cpp
-glGetFloatv(GL_MODELVIEW_MATRIX, modelViewRaw);
-glGetFloatv(GL_PROJECTION_MATRIX, projectionRaw);
-```
-и сразу переводит результат в `glm::mat4` через `glm::make_mat4`. Затем стандартный world-to-screen.
-
----
-
-### Важные предупреждения (прочитай до запуска)
-
-**1. Это работает только если игра ещё грузит fixed-function матрицы.**
-
-`glGetFloatv(GL_MODELVIEW_MATRIX)` возвращает содержимое **матричного стека** OpenGL. В современном рендере с шейдерами и UBO стек не заполняется вообще — там всё уходит в uniform-буферы, а функция возвращает `identity` или последнее значение, установленное через `glLoadMatrix`/`glLoadIdentity`.
-
-Я поставил защиту:
-```cpp
-if (modelView == glm::mat4(1.0f) || projection == glm::mat4(1.0f)) goto THE_END;
-```
-Это отсечёт случай, когда драйвер вернул identity. Если после запуска **оверлей по-прежнему пуст** — значит, игра перешла на чистый шейдерный пайплайн, и этот способ не сработает. Признак: в консоли DLL не появится ни одной отправки, `coordsArray` вечно пуст.
-
-**2. `worldPos` — это локальный ноль модели, а не позиция игрока.**
-
-`GL_MODELVIEW_MATRIX` — это `view * model`. Но какая именно `model` там лежит, зависит от того, что игра успела загрузить перед вызовом `glDrawElements`. В fixed-function pipeline модель загружалась через `glLoadMatrixf(model)` или `glTranslatef`/`glRotatef` — тогда `worldPos = (0,0,0,1)` даст правильную точку игрока в мире.
-
-Если игра грузит модель как `glMultMatrixf(view)` и потом отдельно `glMultMatrixf(model)`, всё тоже сработает. Но если она вообще не трогает стек (шейдеры + UBO) — `worldPos` всегда будет проецироваться в одну и ту же точку (вероятно, центр экрана или за его пределами).
-
-**3. Что делать, если точки есть, но они «прилипли» к одной позиции.**
-
-Значит, `modelView` каждый раз одинаковая — игра не обновляет стек. Тут вариантов два:
-- Вернуться к варианту с `modelMatrix` через юниформ (как было раньше), а `view` и `projection` брать через `glGetFloatv`. Это гибрид, который сработает, если `modelMatrix` ещё жив, а `persistentBlock` сломан.
-- Или искать новый способ получить матрицы (например, через `glGetUniformLocation` по новым именам, которые разработчики могли ввести).
-
-**4. Проверка `projectionMatrix[3][3] != 0.0f` убрана.**
-
-Ты был прав, что она ломала весь код при Reversed-Z (там `[3][3]` = 1.0). Теперь её нет — принимаем любую проекцию, лишь бы она была не identity и не нулевая. Если начнут прилетать точки из UI (там часто Ortho-проекция), можно вернуть фильтр, но по конкретному значению: например, `if (projection[3][3] == 1.0f) goto THE_END;` — так отсечёшь ортокамеру и оставишь перспективу.
-
-**5. Логируй для отладки.**
-
-Если результат непонятен — временно вставь сразу после `glGetFloatv`:
-```cpp
-static int logCount = 0;
-if (logCount < 20) {
-    std::cout << "[mv] " << modelView[3][0] << ", " << modelView[3][1] << ", " << modelView[3][2] << "\n";
-    std::cout << "[pj] " << projection[0][0] << ", " << projection[3][3] << "\n";
-    logCount++;
-}
-```
-Это покажет, что реально отдаёт драйвер. Если `modelView[3][0..2]` всегда одинаковые — стек не обновляется, способ не подходит. Если меняются — всё работает, и координаты будут живыми.
-
