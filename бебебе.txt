@@ -1,130 +1,145 @@
-#include "sharedMemory.h"
 #include <Windows.h>
+#include <string>
 #include <iostream>
-#include <vector>
+#include "GL/glew.h"
+#include "options.h"
+#pragma comment(lib, "glew32s.lib")
+#include "hooks.h"
+#include "sharedMemory.h"
+#include <GL/gl.h>
+#pragma comment(lib, "OpenGL32.lib")
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <algorithm>
 
-LPVOID pBuf = nullptr;
-HANDLE hMapFile = nullptr;   // здесь это хендл канала (имя оставил прежним, чтобы не ломать closeMappingHandle)
-
-bool connectSharedMemory() {
-    static bool pipeCreated = false;
-
-    // Храним SD и SA в static, потому что CreateNamedPipe копирует их только
-    // на момент вызова, но для повторных переподключений они должны жить.
-    static SECURITY_DESCRIPTOR sd;
-    static SECURITY_ATTRIBUTES  sa;
-
-    if (!pipeCreated) {
-        // --- 1. Готовим разрешающую DACL ---
-        // InitializeSecurityDescriptor + SetSecurityDescriptorDacl с NULL-DACL
-        // даёт "полный доступ всем". Этого достаточно, чтобы клиент из-под
-        // любой учётки (в т.ч. elevated) смог подключиться к пайпу.
-        if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
-            std::cerr << "[-] InitializeSecurityDescriptor failed: " << GetLastError() << "\n";
-            return false;
-        }
-
-        if (!SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE)) {
-            std::cerr << "[-] SetSecurityDescriptorDacl failed: " << GetLastError() << "\n";
-            return false;
-        }
-
-        sa.nLength              = sizeof(SECURITY_ATTRIBUTES);
-        sa.lpSecurityDescriptor = &sd;
-        sa.bInheritHandle       = FALSE;
-
-        // --- 2. Создаём канал с этим SA ---
-        //  PIPE_ACCESS_DUPLEX  — оставил как было в твоём варианте, чтобы
-        //                        не ломать логику, если ты потом захочешь писать обратно.
-        //  instances = 1       — один клиент (DLL в игре).
-        hMapFile = CreateNamedPipe(
-            L"\\\\.\\pipe\\VirelexPipe",
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,
-            sizeof(CoordData),   // out-buffer  (сервер → клиент)
-            sizeof(CoordData),   // in-buffer   (клиент → сервер)
-            0,
-            &sa                  // <-- вот сюда прокидываем SECURITY_ATTRIBUTES
-        );
-
-        if (hMapFile == INVALID_HANDLE_VALUE) {
-            std::cerr << "[-] CreateNamedPipe failed: " << GetLastError() << "\n";
-            return false;
-        }
-
-        pipeCreated = true;
-    }
-
-    // --- 3. Ждём клиента ---
-    // ConnectNamedPipe блокирующий: пока DLL внутри игры не сделает CreateFile,
-    // эта функция не вернётся. Если вызываешь из главного потока рендера —
-    // выноси в отдельный поток, иначе получишь фриз до запуска игры.
-    printf("[cheat]: Waiting for client connection...\n");
-
-    BOOL connected = ConnectNamedPipe(hMapFile, NULL);
-    DWORD err = GetLastError();
-
-    if (!connected && err != ERROR_PIPE_CONNECTED) {
-        std::cerr << "[-] ConnectNamedPipe failed: " << err << "\n";
-        DisconnectNamedPipe(hMapFile);
-        return false;
-    }
-
-    // --- 4. Буфер под структуру выделяем один раз ---
-    if (!pBuf) {
-        pBuf = malloc(sizeof(CoordData));
-        if (!pBuf) {
-            std::cerr << "[-] malloc failed.\n";
-            return false;
-        }
-        shared::sharedData = (CoordData*)pBuf;
-        // на всякий случай обнулим, чтобы count не был мусором до первого чтения
-        ZeroMemory(shared::sharedData, sizeof(CoordData));
-    }
-
-    // --- 5. Читаем один пакет ---
-    DWORD bytesRead = 0;
-    if (!ReadFile(hMapFile, shared::sharedData, sizeof(CoordData), &bytesRead, NULL)) {
-        std::cerr << "[-] ReadFile failed: " << GetLastError() << "\n";
-        DisconnectNamedPipe(hMapFile);
-        return false;
-    }
-
-    if (bytesRead != sizeof(CoordData)) {
-        std::cerr << "[-] ReadFile partial: " << bytesRead
-                  << " of " << sizeof(CoordData) << "\n";
-        // Считаем это неуспехом, но не рвём канал — возможно, клиент ещё пишет.
-        return false;
-    }
-
-    return true;
+glm::vec4 getPositionFromMatrix(const glm::mat4& matrix) {
+    return glm::vec4(matrix[3][0], matrix[3][1], matrix[3][2], matrix[3][3]);
 }
 
-void closeMappingHandle() {
-    if (hMapFile && hMapFile != INVALID_HANDLE_VALUE) {
-        DisconnectNamedPipe(hMapFile);
-        CloseHandle(hMapFile);
-        hMapFile = nullptr;
+std::vector<std::pair<float, float>> coordsArray;
+
+void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+
+    static bool glewInitialized = false;
+
+    if (!glewInitialized) {
+        if (glewInit() != GLEW_OK) {
+            MessageBoxA(NULL, "Failed to activate GLEW", "Error", MB_ICONERROR);
+        }
+        glewInitialized = true;
     }
-    if (pBuf) {
-        free(pBuf);
-        pBuf = nullptr;
-        shared::sharedData = nullptr;
+
+    // --- 1. Железный фильтр полигонов ---
+    // Модели игроков и крупных энтити состоят из большого числа индексов
+    // (обычно > 1000). Трава, листья, декали и мелкие блоки — count < 1000.
+    // Всё, что больше 150000 — это скорее всего гигантский ландшафт/скайбокс,
+    // который нам тоже не нужен.
+    // mode == 4 — это GL_TRIANGLES (стандарт для 3D-моделей).
+    bool isReady = (count >= 1000 && count <= 150000) && (mode == 4);
+
+    GLint currentProgram;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
+
+    // 2. Проверку ширины текстуры отключили — она ломала работу после обновления игры.
+    // GLint textureWidth;
+    // glGetIntegerv(GL_TEXTURE_WIDTH, &textureWidth);
+    // if (textureWidth <= 50) goto THE_END;
+
+    if (isReady) {
+        GLint location = glGetUniformLocation(currentProgram, "isAnimated");
+        GLint isAnimated;
+
+        if (location == -1) {
+            goto THE_END;
+        }
+        else {
+            glGetUniformiv(currentProgram, location, &isAnimated);
+        }
+
+        if (isAnimated != 1) goto THE_END;
+
+        GLint uniformCount = 0;
+        glGetProgramiv(currentProgram, GL_ACTIVE_UNIFORMS, &uniformCount);
+
+        // 3. Блок, который ломал всё после обновления игры — отключён.
+        /*
+        if (uniformCount == 41 || uniformCount == 40 || uniformCount == 30 || uniformCount == 36) {
+            goto THE_END;
+        }
+        */
+
+        glm::mat4 modelMatrix{ 0 };
+
+        GLint modelMatrixLocation = glGetUniformLocation(currentProgram, "modelMatrix");
+
+        if (modelMatrixLocation != -1) {
+            glGetUniformfv(currentProgram, modelMatrixLocation, glm::value_ptr(modelMatrix));
+        }
+        else {
+            goto THE_END;
+        }
+
+        GLuint blockIndexPersist = glGetUniformBlockIndex(currentProgram, "persistentBlock");
+        if (blockIndexPersist == GL_INVALID_INDEX) goto THE_END;
+
+        GLint currentUBO;
+        glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &currentUBO);
+
+        GLuint ubo{ 0 };
+        glGenBuffers(1, &ubo);
+
+        if (ubo == 0) goto THE_END;
+
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+
+        glBufferData(GL_UNIFORM_BUFFER, sizeof(glm::mat4) * 2, NULL, GL_STATIC_DRAW);
+        glUniformBlockBinding(currentProgram, blockIndexPersist, 0);
+
+        glm::mat4 viewMatrix{ 0 };
+        glm::mat4 projectionMatrix{ 0 };
+
+        glGetBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(glm::mat4), glm::value_ptr(viewMatrix));
+        glGetBufferSubData(GL_UNIFORM_BUFFER, sizeof(glm::mat4), sizeof(glm::mat4), glm::value_ptr(projectionMatrix));
+
+        glBindBuffer(GL_UNIFORM_BUFFER, currentUBO);
+
+        if (modelMatrix == glm::mat4(0.0f) || viewMatrix == glm::mat4(0.0f) || projectionMatrix == glm::mat4(0.0f) || projectionMatrix[3][3] != 0.0f) {
+            goto THE_END;
+        }
+
+        glm::vec4 worldPos = getPositionFromMatrix(modelMatrix);
+
+        float headHeight = 1.65f; //points at the legs, so I decided to lift it for aimbot
+        worldPos.y += headHeight;
+
+        glm::vec4 viewPosition = viewMatrix * worldPos;
+
+        glm::vec4 clipPosition = projectionMatrix * viewPosition;
+
+        if (clipPosition.w == 0.0f) goto THE_END;
+
+        glm::vec4 ndcPosition = glm::vec4(clipPosition) / clipPosition.w;
+
+        float screenX = (ndcPosition.x + 1.0f) / 2.0f * options::monitorX;
+        float screenY = (1.0f - ndcPosition.y) / 2.0f * options::monitorY;
+
+        if (screenX < options::monitorX && screenX > 0.0f && screenY > 0.0f && screenY < options::monitorY) {
+            coordsArray.push_back({ screenX, screenY });
+        }
     }
+
+THE_END:
+
+    fn_glDrawElements(mode, count, type, indices);
 }
 
-void getEntitiesArray(std::vector<std::pair<float, float>>& outArray) {
-    if (!shared::sharedData) return;
+void WINAPI Hooks::hk_glFlush() {
 
-    int count = shared::sharedData->count;
-    if (count <= 0) return;
-    if (count > MAX_ENTITIES) count = MAX_ENTITIES;  // страховка от рассинхрона версий
-
-    outArray.clear();
-    outArray.reserve(count);
-
-    for (int i = 0; i < count; ++i) {
-        outArray.push_back(shared::sharedData->entities[i]);
+    if (!coordsArray.empty()) {
+        writeEntitiesToShared(coordsArray, coordsArray.size());
+        coordsArray.clear();
     }
+
+    fn_glFlush();
 }
