@@ -4,90 +4,86 @@
 #include <vector>
 
 LPVOID pBuf = nullptr;
-HANDLE hMapFile = nullptr;
-
-bool createMappingData() {
-    hMapFile = CreateFileMapping(
-        INVALID_HANDLE_VALUE,
-        NULL,
-        PAGE_READWRITE,
-        0,
-        sizeof(CoordData),
-        L"Local\\Virelex"          // <--- было Global\\Virelex
-    );
-    if (hMapFile == NULL) {
-        //std::cerr << "[-] Failed to create file mapping object!" << std::endl;
-        return false;
-    }
-
-    pBuf = MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(CoordData));
-    if (pBuf == NULL) {
-        //std::cerr << "[-] Failed to map view of file!" << std::endl;
-        return false;
-    }
-
-    shared::sharedData = (CoordData*)pBuf;
-
-    return true;
-}
-
-void closeMappingHandle() {
-    UnmapViewOfFile(pBuf);
-    CloseHandle(hMapFile);
-}
-
-void writeEntitiesToShared(const std::vector<std::pair<float, float>>& entities, const int count) {
-    shared::sharedData->count = count;
-
-    for (int i = 0; i < shared::sharedData->count; i++) {
-        shared::sharedData->entities[i] = entities[i];
-    }
-}
-и 
-#include "sharedMemory.h"
-#include <Windows.h>
-#include <iostream>
-#include <vector>
-#include <Windows.h>
-
-LPVOID pBuf = nullptr;
-HANDLE hMapFile = nullptr;
+HANDLE hMapFile = nullptr;   // здесь это уже хендл канала, но имя оставил прежним
 
 bool connectSharedMemory() {
-    hMapFile = OpenFileMapping(
-        FILE_MAP_ALL_ACCESS,
-        FALSE,
-        L"Local\\Virelex"          // <--- было Global\\Virelex
-    );
-    if (hMapFile == NULL) {
+    static bool pipeCreated = false;
+
+    // Сервер создаётся один раз. PIPE_ACCESS_INBOUND — серверу нужно только читать.
+    if (!pipeCreated) {
+        hMapFile = CreateNamedPipe(
+            L"\\\\.\\pipe\\VirelexPipe",
+            PIPE_ACCESS_INBOUND,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            sizeof(CoordData),
+            sizeof(CoordData),
+            0,
+            NULL
+        );
+
+        if (hMapFile == INVALID_HANDLE_VALUE) {
+            std::cerr << "[-] CreateNamedPipe failed: " << GetLastError() << "\n";
+            return false;
+        }
+        pipeCreated = true;
+    }
+
+    // Ждём подключения клиента (DLL внутри игры). ConnectNamedPipe блокирующий —
+    // если вызовешь в главном потоке рендера, оверлей замёрзнет до запуска игры.
+    printf("[cheat]: Waiting for client connection...\n");
+    if (!ConnectNamedPipe(hMapFile, NULL)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_PIPE_CONNECTED) {
+            std::cerr << "[-] ConnectNamedPipe failed: " << err << "\n";
+            return false;
+        }
+    }
+
+    // Буфер под структуру выделяем один раз.
+    if (!pBuf) {
+        pBuf = malloc(sizeof(CoordData));
+        shared::sharedData = (CoordData*)pBuf;
+    }
+
+    // Одна итерация ReadFile = один пакет данных от клиента (один WriteFile).
+    DWORD bytesRead = 0;
+    if (!ReadFile(hMapFile, shared::sharedData, sizeof(CoordData), &bytesRead, NULL)) {
+        std::cerr << "[-] ReadFile failed: " << GetLastError() << "\n";
+        DisconnectNamedPipe(hMapFile);  // разрываем — следующее подключение будет новым
         return false;
     }
 
-    pBuf = MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(CoordData));
-    if (pBuf == NULL) {
-        CloseHandle(hMapFile);
+    if (bytesRead != sizeof(CoordData)) {
+        std::cerr << "[-] ReadFile returned partial data: " << bytesRead << "\n";
         return false;
     }
-
-    shared::sharedData = (CoordData*)pBuf;
 
     return true;
 }
 
 void closeMappingHandle() {
-    UnmapViewOfFile(pBuf);
-    CloseHandle(hMapFile);
+    if (hMapFile && hMapFile != INVALID_HANDLE_VALUE) {
+        DisconnectNamedPipe(hMapFile);
+        CloseHandle(hMapFile);
+        hMapFile = nullptr;
+    }
+    if (pBuf) {
+        free(pBuf);
+        pBuf = nullptr;
+        shared::sharedData = nullptr;
+    }
 }
 
 void getEntitiesArray(std::vector<std::pair<float, float>>& outArray) {
-    int count = shared::sharedData->count;
+    if (!shared::sharedData) return;
 
-    if (count == 0) {
-        return; 
-    }
+    int count = shared::sharedData->count;
+    if (count <= 0) return;
+    if (count > MAX_ENTITIES) count = MAX_ENTITIES;  // страховка от рассинхрона
 
     outArray.clear();
-    outArray.reserve(count); 
+    outArray.reserve(count);
 
     for (int i = 0; i < count; ++i) {
         outArray.push_back(shared::sharedData->entities[i]);
