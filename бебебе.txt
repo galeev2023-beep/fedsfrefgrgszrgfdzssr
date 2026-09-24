@@ -1,139 +1,122 @@
 #include <Windows.h>
-#include <string>
 #include <iostream>
-#include "GL/glew.h"
 #include "options.h"
-#pragma comment(lib, "glew32s.lib")
-#include "hooks.h"
+#include "MinHook.h"
 #include "sharedMemory.h"
+
+#if defined _M_X64
+#pragma comment(lib, "libMinHook.x64.lib")
+#elif defined _M_IX86
+#pragma comment(lib, "libMinHook.x86.lib")
+#endif
+
+#include "hooks.h"
+
 #include <GL/gl.h>
 #pragma comment(lib, "OpenGL32.lib")
-#include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
-#include <algorithm>
 
-glm::vec4 getPositionFromMatrix(const glm::mat4& matrix) {
-    return glm::vec4(matrix[3][0], matrix[3][1], matrix[3][2], matrix[3][3]);
+void cheatInitialize() {
+    std::cout << "[+] cheatInitialize() started.\n";
+
+    // --- 1. Инициализация MinHook ---
+    std::cout << "[*] Initializing MinHook...\n";
+    MH_STATUS mhStatus = MH_Initialize();
+    if (mhStatus != MH_OK) {
+        std::cout << "[-] Failed to initialize MinHook. Status code: " << mhStatus << "\n";
+        return;
+    }
+    std::cout << "[+] MinHook initialized successfully.\n";
+
+    // --- 2. Создание разделяемой памяти ---
+    std::cout << "[*] Creating shared memory mapping...\n";
+    if (!createMappingData()) {
+        std::cout << "[-] createMappingData() failed. Shared memory not created.\n";
+        return;
+    }
+    std::cout << "[+] Shared memory created successfully.\n";
+
+    // --- 3. Получение размеров экрана ---
+    options::monitorX = (float)GetSystemMetrics(SM_CXSCREEN);
+    options::monitorY = (float)GetSystemMetrics(SM_CYSCREEN);
+    std::cout << "[+] Screen resolution: " << options::monitorX << " x " << options::monitorY << "\n";
+
+    // --- 4. Создание хука glDrawElements ---
+    std::cout << "[*] Creating hook for glDrawElements...\n";
+    mhStatus = MH_CreateHook(
+        &glDrawElements,
+        Hooks::get_glDrawElements(),
+        reinterpret_cast<void**>(&fn_glDrawElements)
+    );
+    if (mhStatus != MH_OK) {
+        std::cout << "[-] Failed to create hook for glDrawElements. Status code: " << mhStatus << "\n";
+    }
+    else {
+        std::cout << "[+] Hook for glDrawElements created.\n";
+    }
+
+    // --- 5. Создание хука glFlush ---
+    std::cout << "[*] Creating hook for glFlush...\n";
+    mhStatus = MH_CreateHook(
+        &glFlush,
+        Hooks::get_glFlush(),
+        reinterpret_cast<void**>(&fn_glFlush)
+    );
+    if (mhStatus != MH_OK) {
+        std::cout << "[-] Failed to create hook for glFlush. Status code: " << mhStatus << "\n";
+    }
+    else {
+        std::cout << "[+] Hook for glFlush created.\n";
+    }
+
+    // --- 6. Включение хука glDrawElements ---
+    std::cout << "[*] Enabling hook glDrawElements...\n";
+    mhStatus = MH_EnableHook(&glDrawElements);
+    if (mhStatus != MH_OK) {
+        std::cout << "[-] Failed to enable hook glDrawElements. Status code: " << mhStatus << "\n";
+    }
+    else {
+        std::cout << "[+] Hook glDrawElements enabled.\n";
+    }
+
+    // --- 7. Включение хука glFlush ---
+    std::cout << "[*] Enabling hook glFlush...\n";
+    mhStatus = MH_EnableHook(&glFlush);
+    if (mhStatus != MH_OK) {
+        std::cout << "[-] Failed to enable hook glFlush. Status code: " << mhStatus << "\n";
+    }
+    else {
+        std::cout << "[+] Hook glFlush enabled.\n";
+    }
+
+    std::cout << "[+] cheatInitialize() finished.\n";
 }
 
-std::vector<std::pair<float, float>> coordsArray;
+void createConsole() {
+    AllocConsole();
 
-void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+    FILE* stream;
+    freopen_s(&stream, "CONOUT$", "w", stdout);
+    freopen_s(&stream, "CONOUT$", "w", stderr);
 
-    static bool glewInitialized = false;
-
-    if (!glewInitialized) {
-        if (glewInit() != GLEW_OK) {
-            MessageBoxA(NULL, "Failed to activate GLEW", "Error", MB_ICONERROR);
-        }
-        glewInitialized = true;
-    }
-
-    bool isReady = count > 3000 && count < 300000 && mode == 4; // prob better to delete it
-
-    GLint currentProgram;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
-
-    // 1. Проверку ширины текстуры отключили — она ломала работу после обновления игры.
-    // GLint textureWidth;
-    // glGetIntegerv(GL_TEXTURE_WIDTH, &textureWidth);
-    // if (textureWidth <= 50) goto THE_END;
-
-    if (isReady) {
-        GLint location = glGetUniformLocation(currentProgram, "isAnimated");
-        GLint isAnimated;
-
-        if (location == -1) {
-            goto THE_END;
-        }
-        else {
-            glGetUniformiv(currentProgram, location, &isAnimated);
-        }
-
-        if (isAnimated != 1) goto THE_END;
-
-        GLint uniformCount = 0;
-        glGetProgramiv(currentProgram, GL_ACTIVE_UNIFORMS, &uniformCount);
-
-        // 2. Блок, который ломал всё после обновления игры — отключён.
-        /*
-        if (uniformCount == 41 || uniformCount == 40 || uniformCount == 30 || uniformCount == 36) {
-            goto THE_END;
-        }
-        */
-
-        glm::mat4 modelMatrix{ 0 };
-
-        GLint modelMatrixLocation = glGetUniformLocation(currentProgram, "modelMatrix");
-
-        if (modelMatrixLocation != -1) {
-            glGetUniformfv(currentProgram, modelMatrixLocation, glm::value_ptr(modelMatrix));
-        }
-        else {
-            goto THE_END;
-        }
-
-        GLuint blockIndexPersist = glGetUniformBlockIndex(currentProgram, "persistentBlock");
-        if (blockIndexPersist == GL_INVALID_INDEX) goto THE_END;
-
-        GLint currentUBO;
-        glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &currentUBO);
-
-        GLuint ubo{ 0 };
-        glGenBuffers(1, &ubo);
-
-        if (ubo == 0) goto THE_END;
-
-        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
-
-        glBufferData(GL_UNIFORM_BUFFER, sizeof(glm::mat4) * 2, NULL, GL_STATIC_DRAW);
-        glUniformBlockBinding(currentProgram, blockIndexPersist, 0);
-
-        glm::mat4 viewMatrix{ 0 };
-        glm::mat4 projectionMatrix{ 0 };
-
-        glGetBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(glm::mat4), glm::value_ptr(viewMatrix));
-        glGetBufferSubData(GL_UNIFORM_BUFFER, sizeof(glm::mat4), sizeof(glm::mat4), glm::value_ptr(projectionMatrix));
-
-        glBindBuffer(GL_UNIFORM_BUFFER, currentUBO);
-
-        if (modelMatrix == glm::mat4(0.0f) || viewMatrix == glm::mat4(0.0f) || projectionMatrix == glm::mat4(0.0f) || projectionMatrix[3][3] != 0.0f) {
-            goto THE_END;
-        }
-
-        glm::vec4 worldPos = getPositionFromMatrix(modelMatrix);
-
-        float headHeight = 1.65f; //points at the legs, so I decided to lift it for aimbot
-        worldPos.y += headHeight;
-
-        glm::vec4 viewPosition = viewMatrix * worldPos;
-
-        glm::vec4 clipPosition = projectionMatrix * viewPosition;
-
-        if (clipPosition.w == 0.0f) goto THE_END;
-
-        glm::vec4 ndcPosition = glm::vec4(clipPosition) / clipPosition.w;
-
-        float screenX = (ndcPosition.x + 1.0f) / 2.0f * options::monitorX;
-        float screenY = (1.0f - ndcPosition.y) / 2.0f * options::monitorY;
-
-        if (screenX < options::monitorX && screenX > 0.0f && screenY > 0.0f && screenY < options::monitorY) {
-            coordsArray.push_back({ screenX, screenY });
-        }
-    }
-
-    THE_END:
-
-    fn_glDrawElements(mode, count, type, indices);
+    // Дублируем потоки в C++ — иначе std::cout может не подхватить консоль.
+    std::ios::sync_with_stdio();
+    std::cout.clear();
+    std::cerr.clear();
+    std::cout << "[+] Console allocated.\n";
 }
 
-void WINAPI Hooks::hk_glFlush() {
-    
-    if (!coordsArray.empty()) {
-        writeEntitiesToShared(coordsArray, coordsArray.size());
-        coordsArray.clear();
+bool __stdcall DllMain(HMODULE hModule, DWORD ulReason, LPVOID lpReserved) {
+    if (ulReason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+
+        createConsole(); // <--- раскомментировано: консоль теперь работает
+
+        cheatInitialize();
+    }
+    else if (ulReason == DLL_PROCESS_DETACH) {
+        MH_Uninitialize();
+        closeMappingHandle();
     }
 
-    fn_glFlush();
+    return true;
 }
