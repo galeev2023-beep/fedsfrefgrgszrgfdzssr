@@ -1,122 +1,95 @@
+#include "sharedMemory.h"
 #include <Windows.h>
 #include <iostream>
-#include "options.h"
-#include "MinHook.h"
-#include "sharedMemory.h"
+#include <vector>
 
-#if defined _M_X64
-#pragma comment(lib, "libMinHook.x64.lib")
-#elif defined _M_IX86
-#pragma comment(lib, "libMinHook.x86.lib")
-#endif
+LPVOID pBuf = nullptr;
+HANDLE hMapFile = nullptr;
 
-#include "hooks.h"
-
-#include <GL/gl.h>
-#pragma comment(lib, "OpenGL32.lib")
-
-void cheatInitialize() {
-    std::cout << "[+] cheatInitialize() started.\n";
-
-    // --- 1. Инициализация MinHook ---
-    std::cout << "[*] Initializing MinHook...\n";
-    MH_STATUS mhStatus = MH_Initialize();
-    if (mhStatus != MH_OK) {
-        std::cout << "[-] Failed to initialize MinHook. Status code: " << mhStatus << "\n";
-        return;
-    }
-    std::cout << "[+] MinHook initialized successfully.\n";
-
-    // --- 2. Создание разделяемой памяти ---
-    std::cout << "[*] Creating shared memory mapping...\n";
-    if (!createMappingData()) {
-        std::cout << "[-] createMappingData() failed. Shared memory not created.\n";
-        return;
-    }
-    std::cout << "[+] Shared memory created successfully.\n";
-
-    // --- 3. Получение размеров экрана ---
-    options::monitorX = (float)GetSystemMetrics(SM_CXSCREEN);
-    options::monitorY = (float)GetSystemMetrics(SM_CYSCREEN);
-    std::cout << "[+] Screen resolution: " << options::monitorX << " x " << options::monitorY << "\n";
-
-    // --- 4. Создание хука glDrawElements ---
-    std::cout << "[*] Creating hook for glDrawElements...\n";
-    mhStatus = MH_CreateHook(
-        &glDrawElements,
-        Hooks::get_glDrawElements(),
-        reinterpret_cast<void**>(&fn_glDrawElements)
+bool createMappingData() {
+    hMapFile = CreateFileMapping(
+        INVALID_HANDLE_VALUE,
+        NULL,
+        PAGE_READWRITE,
+        0,
+        sizeof(CoordData),
+        L"Local\\Virelex"          // <--- было Global\\Virelex
     );
-    if (mhStatus != MH_OK) {
-        std::cout << "[-] Failed to create hook for glDrawElements. Status code: " << mhStatus << "\n";
-    }
-    else {
-        std::cout << "[+] Hook for glDrawElements created.\n";
+    if (hMapFile == NULL) {
+        //std::cerr << "[-] Failed to create file mapping object!" << std::endl;
+        return false;
     }
 
-    // --- 5. Создание хука glFlush ---
-    std::cout << "[*] Creating hook for glFlush...\n";
-    mhStatus = MH_CreateHook(
-        &glFlush,
-        Hooks::get_glFlush(),
-        reinterpret_cast<void**>(&fn_glFlush)
-    );
-    if (mhStatus != MH_OK) {
-        std::cout << "[-] Failed to create hook for glFlush. Status code: " << mhStatus << "\n";
-    }
-    else {
-        std::cout << "[+] Hook for glFlush created.\n";
+    pBuf = MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(CoordData));
+    if (pBuf == NULL) {
+        //std::cerr << "[-] Failed to map view of file!" << std::endl;
+        return false;
     }
 
-    // --- 6. Включение хука glDrawElements ---
-    std::cout << "[*] Enabling hook glDrawElements...\n";
-    mhStatus = MH_EnableHook(&glDrawElements);
-    if (mhStatus != MH_OK) {
-        std::cout << "[-] Failed to enable hook glDrawElements. Status code: " << mhStatus << "\n";
-    }
-    else {
-        std::cout << "[+] Hook glDrawElements enabled.\n";
-    }
-
-    // --- 7. Включение хука glFlush ---
-    std::cout << "[*] Enabling hook glFlush...\n";
-    mhStatus = MH_EnableHook(&glFlush);
-    if (mhStatus != MH_OK) {
-        std::cout << "[-] Failed to enable hook glFlush. Status code: " << mhStatus << "\n";
-    }
-    else {
-        std::cout << "[+] Hook glFlush enabled.\n";
-    }
-
-    std::cout << "[+] cheatInitialize() finished.\n";
-}
-
-void createConsole() {
-    AllocConsole();
-
-    FILE* stream;
-    freopen_s(&stream, "CONOUT$", "w", stdout);
-    freopen_s(&stream, "CONOUT$", "w", stderr);
-
-    // Дублируем потоки в C++ — иначе std::cout может не подхватить консоль.
-    std::ios::sync_with_stdio();
-    std::cout.clear();
-    std::cerr.clear();
-    std::cout << "[+] Console allocated.\n";
-}
-
-bool __stdcall DllMain(HMODULE hModule, DWORD ulReason, LPVOID lpReserved) {
-    if (ulReason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hModule);
-
-        createConsole(); // <--- раскомментировано: консоль теперь работает
-
-        cheatInitialize();
-    }
-    else if (ulReason == DLL_PROCESS_DETACH) {
-        MH_Uninitialize();
-        closeMappingHandle();
-    }
+    shared::sharedData = (CoordData*)pBuf;
 
     return true;
+}
+
+void closeMappingHandle() {
+    UnmapViewOfFile(pBuf);
+    CloseHandle(hMapFile);
+}
+
+void writeEntitiesToShared(const std::vector<std::pair<float, float>>& entities, const int count) {
+    shared::sharedData->count = count;
+
+    for (int i = 0; i < shared::sharedData->count; i++) {
+        shared::sharedData->entities[i] = entities[i];
+    }
+}
+и 
+#include "sharedMemory.h"
+#include <Windows.h>
+#include <iostream>
+#include <vector>
+#include <Windows.h>
+
+LPVOID pBuf = nullptr;
+HANDLE hMapFile = nullptr;
+
+bool connectSharedMemory() {
+    hMapFile = OpenFileMapping(
+        FILE_MAP_ALL_ACCESS,
+        FALSE,
+        L"Local\\Virelex"          // <--- было Global\\Virelex
+    );
+    if (hMapFile == NULL) {
+        return false;
+    }
+
+    pBuf = MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(CoordData));
+    if (pBuf == NULL) {
+        CloseHandle(hMapFile);
+        return false;
+    }
+
+    shared::sharedData = (CoordData*)pBuf;
+
+    return true;
+}
+
+void closeMappingHandle() {
+    UnmapViewOfFile(pBuf);
+    CloseHandle(hMapFile);
+}
+
+void getEntitiesArray(std::vector<std::pair<float, float>>& outArray) {
+    int count = shared::sharedData->count;
+
+    if (count == 0) {
+        return; 
+    }
+
+    outArray.clear();
+    outArray.reserve(count); 
+
+    for (int i = 0; i < count; ++i) {
+        outArray.push_back(shared::sharedData->entities[i]);
+    }
 }
