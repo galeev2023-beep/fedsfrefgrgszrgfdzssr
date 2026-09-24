@@ -30,12 +30,10 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
         glewInitialized = true;
     }
 
-    // --- 1. Железный фильтр полигонов ---
-    // Модели игроков и крупных энтити состоят из большого числа индексов
-    // (обычно > 1000). Трава, листья, декали и мелкие блоки — count < 1000.
-    // Всё, что больше 150000 — это скорее всего гигантский ландшафт/скайбокс,
-    // который нам тоже не нужен.
-    // mode == 4 — это GL_TRIANGLES (стандарт для 3D-моделей).
+    // --- 1. Фильтр полигонов ---
+    // Модели игроков и крупных энтити — большое количество индексов (> 1000).
+    // Трава, листья, декали — мелкие (< 1000). Скайбокс/ландшафт — > 150000.
+    // mode == 4 — это GL_TRIANGLES.
     bool isReady = (count >= 1000 && count <= 150000) && (mode == 4);
 
     GLint currentProgram;
@@ -69,6 +67,7 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
         }
         */
 
+        // --- 4. modelMatrix ---
         glm::mat4 modelMatrix{ 0 };
 
         GLint modelMatrixLocation = glGetUniformLocation(currentProgram, "modelMatrix");
@@ -80,21 +79,26 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
             goto THE_END;
         }
 
+        // --- 5. persistentBlock → игровой UBO → view/projection ---
         GLuint blockIndexPersist = glGetUniformBlockIndex(currentProgram, "persistentBlock");
         if (blockIndexPersist == GL_INVALID_INDEX) goto THE_END;
 
-        GLint currentUBO;
-        glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &currentUBO);
+        // Узнаём binding point, к которому привязан persistentBlock.
+        GLint bindingPoint = 0;
+        glGetActiveUniformBlockiv(currentProgram, blockIndexPersist,
+                                  GL_UNIFORM_BLOCK_BINDING, &bindingPoint);
 
-        GLuint ubo{ 0 };
-        glGenBuffers(1, &ubo);
+        // Узнаём, какой реальный UBO сидит на этой binding point — это игровой буфер.
+        GLint gameUbo = 0;
+        glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, bindingPoint, &gameUbo);
+        if (gameUbo == 0) goto THE_END;
 
-        if (ubo == 0) goto THE_END;
+        // Сохраняем текущую привязку GL_UNIFORM_BUFFER, чтобы вернуть её после чтения.
+        GLint previousUBO = 0;
+        glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &previousUBO);
 
-        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
-
-        glBufferData(GL_UNIFORM_BUFFER, sizeof(glm::mat4) * 2, NULL, GL_STATIC_DRAW);
-        glUniformBlockBinding(currentProgram, blockIndexPersist, 0);
+        // Привязываем игровой UBO и читаем из него матрицы.
+        glBindBuffer(GL_UNIFORM_BUFFER, gameUbo);
 
         glm::mat4 viewMatrix{ 0 };
         glm::mat4 projectionMatrix{ 0 };
@@ -102,15 +106,21 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
         glGetBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(glm::mat4), glm::value_ptr(viewMatrix));
         glGetBufferSubData(GL_UNIFORM_BUFFER, sizeof(glm::mat4), sizeof(glm::mat4), glm::value_ptr(projectionMatrix));
 
-        glBindBuffer(GL_UNIFORM_BUFFER, currentUBO);
+        // Возвращаем прежнюю привязку — иначе сломаем рендер игры.
+        glBindBuffer(GL_UNIFORM_BUFFER, previousUBO);
 
-        if (modelMatrix == glm::mat4(0.0f) || viewMatrix == glm::mat4(0.0f) || projectionMatrix == glm::mat4(0.0f) || projectionMatrix[3][3] != 0.0f) {
+        // --- 6. Санити-проверки ---
+        if (modelMatrix == glm::mat4(0.0f) ||
+            viewMatrix == glm::mat4(0.0f) ||
+            projectionMatrix == glm::mat4(0.0f) ||
+            projectionMatrix[3][3] != 0.0f) {
             goto THE_END;
         }
 
+        // --- 7. Расчёт экранных координат ---
         glm::vec4 worldPos = getPositionFromMatrix(modelMatrix);
 
-        float headHeight = 1.65f; //points at the legs, so I decided to lift it for aimbot
+        float headHeight = 1.65f; // points at the legs, so I decided to lift it for aimbot
         worldPos.y += headHeight;
 
         glm::vec4 viewPosition = viewMatrix * worldPos;
@@ -124,7 +134,8 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
         float screenX = (ndcPosition.x + 1.0f) / 2.0f * options::monitorX;
         float screenY = (1.0f - ndcPosition.y) / 2.0f * options::monitorY;
 
-        if (screenX < options::monitorX && screenX > 0.0f && screenY > 0.0f && screenY < options::monitorY) {
+        if (screenX < options::monitorX && screenX > 0.0f &&
+            screenY > 0.0f && screenY < options::monitorY) {
             coordsArray.push_back({ screenX, screenY });
         }
     }
