@@ -3,89 +3,111 @@
 #include <iostream>
 #include <vector>
 
-LPVOID pBuf = nullptr;
-HANDLE hMapFile = nullptr;   // здесь это уже хендл канала, но имя оставил прежним
+// Теперь это не хендл маппинга, а хендл канала. Имя переменной оставил
+// прежним, чтобы не ломать те места, где она могла упоминаться.
+HANDLE hPipe = nullptr;
 
-bool connectSharedMemory() {
-    static bool pipeCreated = false;
+// Локальный пакет под отправку. Статический — чтобы не аллоцировать 40 КБ
+// на каждый кадр. Живёт в .bss, инициализируется нулями один раз.
+static CoordData packet;
 
-    // Сервер создаётся один раз. PIPE_ACCESS_INBOUND — серверу нужно только читать.
-    if (!pipeCreated) {
-        hMapFile = CreateNamedPipe(
-            L"\\\\.\\pipe\\VirelexPipe",
-            PIPE_ACCESS_INBOUND,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,
-            sizeof(CoordData),
-            sizeof(CoordData),
+bool createMappingData() {
+    // Оверлей-сервер мог ещё не подняться — ждём его появления.
+    // До ~10 секунд (100 попыток × 100 мс) с паузой между ними.
+    const int maxAttempts = 100;
+
+    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+        hPipe = CreateFile(
+            L"\\\\.\\pipe\\VirelexPipe",   // тот же путь, что и в CreateNamedPipe
+            GENERIC_WRITE,                 // клиент только пишет
+            0,                             // без шаринга
+            NULL,
+            OPEN_EXISTING,                 // открываем существующий канал
             0,
             NULL
         );
 
-        if (hMapFile == INVALID_HANDLE_VALUE) {
-            std::cerr << "[-] CreateNamedPipe failed: " << GetLastError() << "\n";
-            return false;
+        if (hPipe != INVALID_HANDLE_VALUE) {
+            break;
         }
-        pipeCreated = true;
-    }
 
-    // Ждём подключения клиента (DLL внутри игры). ConnectNamedPipe блокирующий —
-    // если вызовешь в главном потоке рендера, оверлей замёрзнет до запуска игры.
-    printf("[cheat]: Waiting for client connection...\n");
-    if (!ConnectNamedPipe(hMapFile, NULL)) {
         DWORD err = GetLastError();
-        if (err != ERROR_PIPE_CONNECTED) {
-            std::cerr << "[-] ConnectNamedPipe failed: " << err << "\n";
+
+        // ERROR_PIPE_BUSY — сервер занят другим клиентом, ждём.
+        // ERROR_FILE_NOT_FOUND — сервер ещё не создал канал, тоже ждём.
+        if (err != ERROR_PIPE_BUSY && err != ERROR_FILE_NOT_FOUND) {
+            std::cerr << "[-] CreateFile pipe failed, code: " << err << "\n";
             return false;
         }
+
+        // Если канал занят — можно подождать его освобождения через WaitNamedPipe,
+        // но простой Sleep тоже работает и не блокирует на неопределённый срок.
+        Sleep(100);
     }
 
-    // Буфер под структуру выделяем один раз.
-    if (!pBuf) {
-        pBuf = malloc(sizeof(CoordData));
-        shared::sharedData = (CoordData*)pBuf;
-    }
-
-    // Одна итерация ReadFile = один пакет данных от клиента (один WriteFile).
-    DWORD bytesRead = 0;
-    if (!ReadFile(hMapFile, shared::sharedData, sizeof(CoordData), &bytesRead, NULL)) {
-        std::cerr << "[-] ReadFile failed: " << GetLastError() << "\n";
-        DisconnectNamedPipe(hMapFile);  // разрываем — следующее подключение будет новым
+    if (hPipe == INVALID_HANDLE_VALUE || hPipe == nullptr) {
+        std::cerr << "[-] Named pipe not available after retries.\n";
+        hPipe = nullptr;
         return false;
     }
 
-    if (bytesRead != sizeof(CoordData)) {
-        std::cerr << "[-] ReadFile returned partial data: " << bytesRead << "\n";
-        return false;
+    // Переводим канал в блокирующий режим: WriteFile будет ждать, пока сервер
+    // освободит буфер, а не возвращать ERROR_NO_DATA на каждом кадре.
+    DWORD mode = PIPE_WAIT;
+    if (!SetNamedPipeHandleState(hPipe, &mode, NULL, NULL)) {
+        std::cerr << "[-] SetNamedPipeHandleState failed: " << GetLastError() << "\n";
+        // Не критично: канал всё равно работает, просто возможны срывы при пиковой нагрузке.
     }
 
+    std::cout << "[+] Connected to overlay pipe.\n";
     return true;
 }
 
 void closeMappingHandle() {
-    if (hMapFile && hMapFile != INVALID_HANDLE_VALUE) {
-        DisconnectNamedPipe(hMapFile);
-        CloseHandle(hMapFile);
-        hMapFile = nullptr;
-    }
-    if (pBuf) {
-        free(pBuf);
-        pBuf = nullptr;
-        shared::sharedData = nullptr;
+    if (hPipe && hPipe != INVALID_HANDLE_VALUE) {
+        // Flush не нужен: WriteFile на канале синхронный, данные уже ушли.
+        CloseHandle(hPipe);
+        hPipe = nullptr;
     }
 }
 
-void getEntitiesArray(std::vector<std::pair<float, float>>& outArray) {
-    if (!shared::sharedData) return;
+void writeEntitiesToShared(const std::vector<std::pair<float, float>>& entities, const int count) {
+    if (!hPipe || hPipe == INVALID_HANDLE_VALUE) {
+        return;
+    }
 
-    int count = shared::sharedData->count;
-    if (count <= 0) return;
-    if (count > MAX_ENTITIES) count = MAX_ENTITIES;  // страховка от рассинхрона
+    // Защита от переполнения: режем до MAX_ENTITIES, иначе вылезем за границы
+    // массива packet.entities и получим порчу стека/краш.
+    int safeCount = (count > MAX_ENTITIES) ? MAX_ENTITIES : count;
 
-    outArray.clear();
-    outArray.reserve(count);
+    packet.count = safeCount;
 
-    for (int i = 0; i < count; ++i) {
-        outArray.push_back(shared::sharedData->entities[i]);
+    for (int i = 0; i < safeCount; ++i) {
+        packet.entities[i] = entities[i];
+    }
+
+    DWORD bytesWritten = 0;
+    BOOL ok = WriteFile(
+        hPipe,
+        &packet,
+        sizeof(CoordData),
+        &bytesWritten,
+        NULL
+    );
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        std::cerr << "[-] WriteFile to pipe failed, code: " << err << "\n";
+
+        // Канал порвался (оверлей закрылся, перезапустился, упал).
+        // Закрываем хендл — следующая инициализация попробует подключиться заново.
+        CloseHandle(hPipe);
+        hPipe = nullptr;
+    }
+    else if (bytesWritten != sizeof(CoordData)) {
+        // Частичная запись. Для PIPE_TYPE_BYTE это ненормально и означает,
+        // что канал перешёл в message-режим или был закрыт на середине.
+        std::cerr << "[-] Partial write: " << bytesWritten
+                  << " of " << sizeof(CoordData) << "\n";
     }
 }
