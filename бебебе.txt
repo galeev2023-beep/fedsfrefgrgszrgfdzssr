@@ -1,6 +1,3 @@
-Готово. Ниже — полный файл со всеми пятью правками.
-
-```cpp
 #include <Windows.h>
 #include <string>
 #include <iostream>
@@ -31,7 +28,7 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
     // 1. БРОНЕБОЙНЫЙ БАРЬЕР ПОЛИГОНОВ
     if (count < 1000 || count > 150000 || mode != 4) goto THE_END;
 
-    // 2. ЗАБОР МАТРИЦ ИЗ ШЕЙДЕРА (вместо чтения случайного UBO)
+    // 2. ЗАБОР МАТРИЦ ИЗ ШЕЙДЕРА
     GLint currentProgram;
     glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
     if (currentProgram <= 0) goto THE_END;
@@ -46,11 +43,14 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
     if (projLoc != -1) glGetUniformfv(currentProgram, projLoc, glm::value_ptr(projectionMatrix));
 
     // Отсекаем мусорный рендер с пустыми матрицами
-    if (projectionMatrix[3][3] == 0.0f || viewMatrix[3][3] == 0.0f) goto THE_END;
+    if (projectionMatrix == glm::mat4(0.0f) || viewMatrix == glm::mat4(0.0f)) goto THE_END;
 
     GLint modelLoc = glGetUniformLocation(currentProgram, "modelMatrix");
     if (modelLoc == -1) goto THE_END;
     glGetUniformfv(currentProgram, modelLoc, glm::value_ptr(modelMatrix));
+
+    // Страховка от пустой modelMatrix
+    if (modelMatrix == glm::mat4(0.0f)) goto THE_END;
 
     // 3. WORLD TO SCREEN ЧЕРЕЗ glm::vec4
     glm::vec4 objPos = modelMatrix * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -81,53 +81,3 @@ void WINAPI Hooks::hk_glFlush() {
 
     fn_glFlush();
 }
-```
-
-Что сделано по твоим пунктам:
-
-1. **Удалены оба `glGetBufferSubData`** — вместо них `glGetUniformLocation` + `glGetUniformfv` для `viewMatrix` и `projectionMatrix`, как для `modelMatrix`.
-2. **Добавлена проверка** `if (projectionMatrix[3][3] == 0.0f || viewMatrix[3][3] == 0.0f) goto THE_END;` сразу под забором.
-3. **Обрезка по границам экрана** — `push_back` теперь только внутри `if (screenX >= 0 && ... <= options::monitorY)`.
-4. **Старая одиночная `coordsArray.push_back({ screenX, screenY });` удалена** — она была только в одном месте, теперь вместо неё блок с проверкой.
-5. **`getPositionFromMatrix` удалена** целиком — вместе с ней ушла и её зависимость от `glm::vec4` конструктора через `matrix[3][...]`, которая теперь не нужна.
-
----
-
-## Претензии к получившемуся коду
-
-### 1. Проверка `projectionMatrix[3][3] == 0.0f` — почти всегда false
-У нормальной perspective-матрицы `[3][3]` равен **0**, а у ортографической — **1**. То есть для перспективного рендера (99% игр) твоя проверка **всегда срабатывает** и ты будешь резать всё подряд. Оригинал проверял `!= 0.0f` — то есть резал *ортографические* матрицы, а не перспективные. У тебя логика перевёрнута: сейчас ты режешь как раз то, что тебе нужно. Меняй на `== 0.0f` только если уверен, что игра использует перспективу и `[3][3]` действительно 0, — иначе получишь пустой оверлей.
-
-### 2. `glGetUniformLocation` для `viewMatrix` / `projectionMatrix` — игра может их так не называть
-Ты угадываешь имена юниформов: `"modelMatrix"`, `"viewMatrix"`, `"projectionMatrix"`. В оригинале автор использовал `"modelMatrix"` — видимо, оно реально есть. А вот `viewMatrix`/`projectionMatrix` могут называться `"u_view"`, `"view"`, `"cameraMatrix"`, `"vMatrix"` и т.д. Если `glGetUniformLocation` вернёт `-1`, ты просто не получишь матрицу, и `clipSpace.w == 0` → отсечёшь. **Проверь имена через RenderDoc / apitrace / Spector.js на живой игре**, иначе код не заработает.
-
-### 3. `viewMatrix` и `projectionMatrix` могут быть объединены в одну `viewProjection`
-Очень частая практика — шейдер получает одну матрицу `vp = projection * view`. Тогда отдельных `viewMatrix`/`projectionMatrix` в шейдере нет вообще. Если так — ищи `"viewProjection"` и умножай сразу `vp * objPos`, без промежуточной `viewMatrix`.
-
-### 4. `viewMatrix` в шейдере — это часто `mat3`, а не `mat4`
-В некоторых движках view передаётся как 3×3, а трансляция камеры вынесена отдельно (`cameraPos`). Тогда `glGetUniformfv` по локации `viewMatrix` перезапишет 9 float'ов поверх первых 9 элементов твоей `glm::mat4`, остальные останутся нулями → матрица будет вырожденной. Никак не проверяется. Если игра такая — надо читать `mat3` и собирать `mat4` вручную.
-
-### 5. `options::monitorX` / `monitorY` могут быть не установлены на момент хука
-Если они нули, условие `screenX >= 0 && screenX <= 0` отсечёт всё. Проверь, что `options::monitorX` инициализируется до первого кадра. Иначе оверлей пустой, а ты думаешь, что матрицы не те.
-
-### 6. `screenY` считается как `(1.0f - ndc.y) / 2.0f * monitorY` — без `viewport`
-Оригинал использовал `viewport[0..3]`, потому что в игре может быть рендер в sub-viewport (например, прицел, картинка в картинке, split-screen). Ты жёстко привязываешься к `monitorX/Y`. Если окно не fullscreen или есть чёрные полосы — координаты поедут. Учитывай `glGetIntegerv(GL_VIEWPORT, ...)` хотя бы для `screenX`/`screenY` offset.
-
-### 7. `count < 1000 || count > 150000` — всё ещё магия
-Не проверено, что модели игроков в твоей версии Сталзона действительно попадают в этот диапазон. Может оказаться, что игрок — это 800 полигонов (тогда ты его не увидишь), а трава — 2000 (тогда увидишь траву). Это не баг кода, это баг порога — но его надо подбирать эмпирически.
-
-### 8. `hk_glFlush` как «раз в кадр» — по-прежнему ненадёжно
-Игра может вызывать `glFlush` несколько раз за кадр или не вызывать вообще (использовать `glFinish` / `SwapBuffers`). Если хочешь стабильно раз в кадр — вешай отправку на хук `wglSwapBuffers`. Иначе получишь либо пачку пакетов, либо потерю кадра.
-
-### 9. Нет проверки на `modelMatrix == 0`
-Если `modelMatrix` не нашлась или шейдер её не устанавливал, `objPos` будет нулевым, а `clipSpace` = позиция камеры в clip-space. Это не отсечётся по `w <= 0.01f` (w будет нормальным), и ты нарисуешь точку в центре экрана. Оригинал это ловил через `modelMatrix == glm::mat4(0.0f)`. Добавь.
-
-### 10. `GLEW` всё ещё инициализируется в `hk_glDrawElements`
-Если этот хук сработает до создания GL-контекста — `glewInit()` упадёт, ты получишь MessageBox, и инициализация не пройдёт. Правильнее — инициализировать GLEW в `hk_wglSwapBuffers` или после `wglMakeCurrent`.
-
----
-
-## Итог
-Работает это или нет — зависит от **пунктов 1, 2, 3, 4** (имена и типы юниформов в конкретной игре) и **пункта 5** (инициализация options). Пункт 1 у тебя сейчас скорее всего **сломан** — проверь обязательно, иначе оверлей будет пустым и ты будешь думать, что дело в матрицах.
-
-Если скинешь вывод RenderDoc / список активных юниформов шейдера игрока — я подгоню имена и типы точно под твою игру.
