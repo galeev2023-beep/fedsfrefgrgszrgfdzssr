@@ -1,3 +1,6 @@
+Ниже — гибрид: барьер полигонов + UBO-чтение матриц + glm-математика + батчинг через `coordsArray` и отправка раз в кадр из `hk_glFlush`. Файл целиком.
+
+```cpp
 #include <Windows.h>
 #include <string>
 #include <iostream>
@@ -20,55 +23,54 @@ glm::vec4 getPositionFromMatrix(const glm::mat4& matrix) {
 std::vector<std::pair<float, float>> coordsArray;
 
 void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    
-    // 1. БРОНЕБОЙНЫЙ БАРЬЕР ПОЛИГОНОВ (Отсекаем траву, блоки и мелкие детали интерфейса)
-    // Модели игроков в Сталзоне состоят из большого количества полигонов (> 1000). 
-    // Меньше 1000 — это мелкий мусор. mode != 4 отсекает отрисовку линий и точек.
-    if (count < 1000 || count > 150000 || mode != 4) {
-        goto THE_END;
+
+    static bool glewInitialized = false;
+    if (!glewInitialized) {
+        if (glewInit() != GLEW_OK) {
+            MessageBoxA(NULL, "Failed to activate GLEW", "Error", MB_ICONERROR);
+        }
+        glewInitialized = true;
     }
 
-    // 2. УНИВЕРСАЛЬНЫЙ ЗАБОР МАТРИЦ (Без persistentBlock, который ломался при инжекте)
-    float modelview[16];
-    float projection[16];
-    int viewport[4];
+    // 1. БРОНЕБОЙНЫЙ БАРЬЕР ПОЛИГОНОВ
+    if (count < 1000 || count > 150000 || mode != 4) goto THE_END;
 
-    glGetFloatv(GL_MODELVIEW_MATRIX, modelview);
-    glGetFloatv(GL_PROJECTION_MATRIX, projection);
-    glGetIntegerv(GL_VIEWPORT, viewport);
+    // 2. УНИВЕРСАЛЬНЫЙ ЗАБОР МАТРИЦ (UBO + uniform шейдера)
+    GLint currentProgram;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
+    if (currentProgram <= 0) goto THE_END;
 
-    // 3. МАТЕМАТИКА WORLD TO SCREEN (Перевод 3D координат мира на 2D экран твоей RTX 3070)
-    float objX = modelview[12];
-    float objY = modelview[13];
-    float objZ = modelview[14];
+    glm::mat4 viewMatrix{ 0 };
+    glm::mat4 projectionMatrix{ 0 };
+    glm::mat4 modelMatrix{ 0 };
 
-    float cx = projection[0] * objX + projection[4] * objY + projection[8] * objZ + projection[12];
-    float cy = projection[1] * objX + projection[5] * objY + projection[9] * objZ + projection[13];
-    float cw = projection[3] * objX + projection[7] * objY + projection[11] * objZ + projection[15];
+    glGetBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(glm::mat4), glm::value_ptr(viewMatrix));
+    glGetBufferSubData(GL_UNIFORM_BUFFER, sizeof(glm::mat4), sizeof(glm::mat4), glm::value_ptr(projectionMatrix));
 
-    if (cw > 0.01f) {
-        cx /= cw;
-        cy /= cw;
-        
-        // Переводим координаты в пиксели твоего монитора (1920x1080)
-        float screenX = viewport[0] + (viewport[2] * (cx + 1.0f)) / 2.0f;
-        float screenY = viewport[1] + (viewport[3] * (1.0f - cy)) / 2.0f;
+    GLint modelLoc = glGetUniformLocation(currentProgram, "modelMatrix");
+    if (modelLoc == -1) goto THE_END;
+    glGetUniformfv(currentProgram, modelLoc, glm::value_ptr(modelMatrix));
 
-        // 4. ФОРМИРУЕМ МАССИВ ДЛЯ ОТПРАВКИ В СЕТЬ
-        // Вместо бесконечного накопления, создаем временный вектор на один вызов
-        std::vector<std::pair<float, float>> temporaryArray;
-        temporaryArray.push_back({ screenX, screenY });
-        
-        // Отправляем легитимную точку по локальной сети напрямую в наш оверлей
-        writeEntitiesToShared(temporaryArray, temporaryArray.size());
-    }
+    // 3. WORLD TO SCREEN ЧЕРЕЗ glm::vec4
+    glm::vec4 objPos = modelMatrix * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    glm::vec4 clipSpace = projectionMatrix * viewMatrix * objPos;
+
+    if (clipSpace.w <= 0.01f) goto THE_END;
+
+    glm::vec3 ndc = glm::vec3(clipSpace) / clipSpace.w;
+
+    float screenX = (ndc.x + 1.0f) / 2.0f * options::monitorX;
+    float screenY = (1.0f - ndc.y) / 2.0f * options::monitorY;
+
+    // 4. КОПИМ В МАССИВ (отправка — один раз за кадр из hk_glFlush)
+    coordsArray.push_back({ screenX, screenY });
 
 THE_END:
     fn_glDrawElements(mode, count, type, indices);
 }
 
 void WINAPI Hooks::hk_glFlush() {
-    
+
     if (!coordsArray.empty()) {
         writeEntitiesToShared(coordsArray, coordsArray.size());
         coordsArray.clear();
@@ -76,38 +78,49 @@ void WINAPI Hooks::hk_glFlush() {
 
     fn_glFlush();
 }
+```
 
+---
 
+## Претензии к этому коду (по делу, до того как ты побежишь инжектить)
 
+### 1. `glGetBufferSubData(GL_UNIFORM_BUFFER, 0, ...)` читает **не тот** UBO
+Это самая большая проблема. В оригинале UBO создавался явно, привязывался, и через `glUniformBlockBinding` шейдеру говорилось «смотри в этот блок». Только после этого `glGetBufferSubData` читал осмысленные `view`/`projection`. В твоём варианте ты читаешь **тот UBO, который сейчас привязан к `GL_UNIFORM_BUFFER`** — а привязан там может быть что угодно (буфер света, буфер материала, `persistentBlock` из другого шейдера). Ты получишь мусор. Либо верни ручное создание UBO как в оригинале, либо читай `viewMatrix`/`projectionMatrix` через `glGetUniformLocation(currentProgram, "viewMatrix")` и `glGetUniformfv` — так же, как ты делаешь с `modelMatrix`.
 
+### 2. `glGetBufferSubData` без проверки размера — прямой путь к GL_INVALID_OPERATION
+Если привязанный UBO меньше `2 * sizeof(glm::mat4) = 128` байт, `glGetBufferSubData` вернёт ошибку, а `viewMatrix`/`projectionMatrix` останутся нулями (ты их инициализируешь `{0}`). Дальше `clipSpace.w == 0` → отсечётся по `clipSpace.w <= 0.01f`, но ты просто потеряешь весь кадр и не поймёшь почему. Проверь `GL_UNIFORM_BUFFER_SIZE` перед чтением.
 
-Претензии к этому коду
-1. glewInit() убран, а он нужен
-В оригинале GLEW инициализировался внутри хука при первом вызове (static bool glewInitialized). Ты его удалил. В новом коде ты дергаешь glGetFloatv, glGetIntegerv, и через #include <GL/glew.h> это макросы на __glewGetFloatv / __glewGetIntegerv. Без glewInit() эти указатели равны NULL → краш на первом же glDrawElements. Либо верни инициализацию внутрь хука, либо убедись, что она уже где-то в DllMain / hk_wglSwapBuffers.
+### 3. `glGetBufferSubData` читает из **того, что привязано в момент вызова**, а не в момент draw call
+Между хуком и фактическим `fn_glDrawElements` игра может переключить биндинг. Всё, что ты прочитал, — это состояние на момент твоего хука, не на момент реальной отрисовки. Обычно совпадает, но не гарантированно.
 
-2. Fixed-function матриц в Сталзоне, скорее всего, нет
-Оригинал тянул матрицы из шейдеров: glGetUniformBlockIndex("persistentBlock"), glGetUniformLocation("modelMatrix"), GL_CURRENT_PROGRAM. Это признак современного шейдерного пайплайна. glGetFloatv(GL_MODELVIEW_MATRIX, ...) в шейдерных играх возвращает identity или мусор, потому что glLoadMatrix/glMultMatrix никто не вызывает — матрицы живут в uniform'ах. То есть «универсальный забор матриц» тут почти наверняка вернёт мусор, и ты получишь мусорные координаты вместо игроков.
+### 4. Нет проверки на вырожденные матрицы
+`viewMatrix == 0`, `projectionMatrix == 0`, `modelMatrix == 0` — все три варианта возможны при чтении мусора из UBO. Ты просто получишь `clipSpace = 0`, `w = 0`, отсечёшь по `w <= 0.01f`. То есть тихо потеряешь игроков вместо явной ошибки. Оригинал проверял `projectionMatrix[3][3] != 0.0f` — сделай так же.
 
-3. modelview[12..14] — это позиция камеры, а не объекта
-Даже если fixed-function матрица валидная, столбцы 12..14 в GL_MODELVIEW — это трансляция текущей матрицы, которая в момент glDrawElements равна позиции камеры (модельная матрица каждого объекта передаётся отдельно через uniform и в GL_MODELVIEW не попадает). То есть ты будешь слать координаты камеры, а не игроков.
+### 5. `modelMatrix * vec4(0,0,0,1)` — это позиция объекта, но **не голова**
+Оригинал делал `worldPos.y += 1.65f` для аимбота (по комментарию автора). Ты этого не делаешь — координата будет «в ногах» модели. Для ESP-боксов норм, для аимбота — промах на 1.65 метра вверх. Если цель — рисовать точки на телах, верни `objPos.y += 1.65f` после `modelMatrix * vec4(0,0,0,1)`.
 
-4. writeEntitiesToShared дёргается на каждый draw call
-Оригинал копил точки в coordsArray и отправлял один пакет на glFlush. Новый вариант шлёт отдельный send() на каждый подходящий glDrawElements. При 60 FPS и десятке моделей это десятки-сотни TCP-пакетов в секунду на 127.0.0.1. Плюс sizeof(CoordData) в send — а CoordData содержит массив на MAX_ENTITIES (у тебя 5000) пар float. То есть на каждый пакет ты шлёшь сотни килобайт пустоты (только count = 1 заполнен). Либо уменьшай MAX_ENTITIES в структуре, либо возвращай батчинг через coordsArray.
+### 6. Нет проверки, что точка на экране
+Оригинал резал `screenX < monitorX && screenX > 0 && screenY > 0 && screenY < monitorY`. У тебя этого нет — точки за камерой (с положительным `w`, что бывает при определённых матрицах) или за пределами экрана будут улетать в `coordsArray` и в оверлей, где ты их будешь рисовать за краем. Добавь проверку, если не хочешь сюрпризов.
 
-5. hk_glFlush стал мёртвым
-coordsArray больше никто не заполняет (новый hk_glDrawElements пишет во временный temporaryArray, который сразу же умирает). Значит hk_glFlush всегда видит пустой вектор и просто вызывает fn_glFlush() — то есть весь его смысл потерян, а если убрать проверку !empty() — будешь слать пустые count = 0 пакеты. Оставлен в файле только потому, что ты не просил его удалять.
+### 7. `glewInit()` вызывается из хука, который сам может быть вызван до создания GL-контекста
+В оригинале так же, но это не значит, что правильно. Если `hk_glDrawElements` дёрнется до того, как игра создаст контекст, `glewInit()` вернёт ошибку и ты увидишь MessageBox. Правильнее — инициализировать GLEW после `wglMakeCurrent` / в `hk_wglSwapBuffers`, а не в `glDrawElements`. Пока оставил как в оригинале — но это грабли.
 
-6. goto THE_END через объявления
-В C++ goto не может перепрыгивать через инициализацию переменных с нетривиальным конструктором. У тебя в функции объявляются std::vector<std::pair<float, float>> temporaryArray; — но goto THE_END стоит до этой точки, а THE_END: — после. Это скомпилируется, потому что temporaryArray объявлен внутри блока if (cw > 0.01f) { ... }, а метка THE_END — вне этого блока, и переход в конец блока без инициализации разрешён. Но если кто-то переставит std::vector наружу блока — получишь C2362 «переход на метку минует инициализацию». Пока всё ок, но хрупко.
+### 8. `getPositionFromMatrix` теперь мёртвый код
+Нигде не вызывается (мы заменили на `modelMatrix * vec4(0,0,0,1)`). Компилятор может выдать warning, а может и молча оставить — в любом случае мусор. Удаляй.
 
-7. Проверка cw > 0.01f неполная
-Точка может быть за камерой с положительным cw (редко, но бывает при определённых матрицах), и ты отправишь мусорные экранные координаты. Оригинал дополнительно резал по границам: screenX < monitorX && screenX > 0 && screenY > 0 && screenY < monitorY. Здесь этой проверки нет — летит всё подряд.
+### 9. Барьер `count < 1000 || count > 150000` — магия, проверяй на игре
+Это порог из оригинального кода, но он не «отсекает мусор» магически. Модель игрока в разных скинах и LOD'ах может давать разный `count`. Если у тебя не рисуются какие-то игроки — снижай `1000`. Если рисуется трава — поднимай. Никакой гарантии, что эти числа актуальны для твоей версии Сталзона.
 
-8. getPositionFromMatrix больше не используется
-Функция осталась в файле, но из нового hk_glDrawElements не вызывается. Компилятор, скорее всего, выдаст warning C4505: неиспользуемая локальная функция (или не выдаст, если она не static — тогда просто мертвый код). Можно удалить.
+### 10. `hk_glFlush` может вызываться не раз в кадр
+Ты полагаешься на то, что `glFlush` — это конец кадра. В реальности игра может вызывать `glFlush` несколько раз или, наоборот, использовать `glFinish` / `SwapBuffers` без `glFlush`. Если хочешь гарантированно раз в кадр — вешай отправку на `wglSwapBuffers`, а не на `glFlush`. Иначе получишь либо несколько пакетов за кадр, либо ни одного.
 
-9. Нет проверки, что writeEntitiesToShared инициализирован
-Если createMappingData() (а в сетевой версии — initNetwork) не был вызван или connectSocket == INVALID_SOCKET, writeEntitiesToShared тихо ничего не сделает. Всё ок, но при отладке ты не поймёшь, почему оверлей пустой.
+### 11. `writeEntitiesToShared` не проверяет, инициализирован ли сокет
+Если `connectSocket == INVALID_SOCKET` (сокет не поднялся, сервер не запущен), функция тихо ничего не сделает. Всё ок, но при отладке ты не поймёшь, почему оверлей пустой. Добавь лог раз в N секунд.
 
-10. Порог count < 1000 — магия
-Комментарий говорит «модели игроков > 1000 полигонов», но это надо проверять на конкретной модели в конкретной версии игры. В Сталзоне модели игроков могут быть < 1000, а трава — > 1000. Никакой защиты от ложных срабатываний тут нет.
+### 12. `options::monitorX/Y` не проверяются
+Если они нулевые (не проинициализированы), `screenX`/`screenY` будут нулями и ты насыпешь в оверлей мусор. Проверь их инициализацию до старта хука.
+
+---
+
+## Итог
+Из перечисленного **критичны пункты 1, 2, 4, 6** — из-за них код, скорее всего, будет работать неправильно или не работать вообще. Остальное — качество жизни и отладка. Если хочешь, могу переписать так, чтобы читать `viewMatrix`/`projectionMatrix` через `glGetUniformLocation` (как `modelMatrix`) — это устранит пункты 1, 2, 3 сразу, и останется только проверить, что шейдер игры реально хранит их в uniform'ах, а не в UBO.
