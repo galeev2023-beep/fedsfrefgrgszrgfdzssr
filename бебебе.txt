@@ -69,8 +69,7 @@ void closeMappingHandle() {
 }
 
 void writeEntitiesToShared(const std::vector<std::pair<float, float>>& entities, const int count) {
-    int safeCount = count;
-    if (safeCount > 5000) safeCount = 5000;
+    int safeCount = (count > MAX_ENTITIES) ? MAX_ENTITIES : count;
     if (safeCount < 0) safeCount = 0;
 
     shared::sharedData->count = safeCount;
@@ -82,6 +81,7 @@ void writeEntitiesToShared(const std::vector<std::pair<float, float>>& entities,
     // Build packet and send over TCP
     CoordData packet{};
     packet.count = safeCount;
+
     for (int i = 0; i < safeCount; i++) {
         packet.entities[i] = entities[i];
     }
