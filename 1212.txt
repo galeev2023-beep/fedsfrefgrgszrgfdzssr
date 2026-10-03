@@ -1,6 +1,3 @@
-Ниже — гибрид: барьер полигонов + UBO-чтение матриц + glm-математика + батчинг через `coordsArray` и отправка раз в кадр из `hk_glFlush`. Файл целиком.
-
-```cpp
 #include <Windows.h>
 #include <string>
 #include <iostream>
@@ -15,10 +12,6 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <algorithm>
-
-glm::vec4 getPositionFromMatrix(const glm::mat4& matrix) {
-    return glm::vec4(matrix[3][0], matrix[3][1], matrix[3][2], matrix[3][3]);
-}
 
 std::vector<std::pair<float, float>> coordsArray;
 
@@ -35,7 +28,7 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
     // 1. БРОНЕБОЙНЫЙ БАРЬЕР ПОЛИГОНОВ
     if (count < 1000 || count > 150000 || mode != 4) goto THE_END;
 
-    // 2. УНИВЕРСАЛЬНЫЙ ЗАБОР МАТРИЦ (UBO + uniform шейдера)
+    // 2. ЗАБОР МАТРИЦ ИЗ ШЕЙДЕРА
     GLint currentProgram;
     glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
     if (currentProgram <= 0) goto THE_END;
@@ -44,12 +37,20 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
     glm::mat4 projectionMatrix{ 0 };
     glm::mat4 modelMatrix{ 0 };
 
-    glGetBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(glm::mat4), glm::value_ptr(viewMatrix));
-    glGetBufferSubData(GL_UNIFORM_BUFFER, sizeof(glm::mat4), sizeof(glm::mat4), glm::value_ptr(projectionMatrix));
+    GLint viewLoc = glGetUniformLocation(currentProgram, "viewMatrix");
+    GLint projLoc = glGetUniformLocation(currentProgram, "projectionMatrix");
+    if (viewLoc != -1) glGetUniformfv(currentProgram, viewLoc, glm::value_ptr(viewMatrix));
+    if (projLoc != -1) glGetUniformfv(currentProgram, projLoc, glm::value_ptr(projectionMatrix));
+
+    // Отсекаем мусорный рендер с пустыми матрицами
+    if (projectionMatrix == glm::mat4(0.0f) || viewMatrix == glm::mat4(0.0f)) goto THE_END;
 
     GLint modelLoc = glGetUniformLocation(currentProgram, "modelMatrix");
     if (modelLoc == -1) goto THE_END;
     glGetUniformfv(currentProgram, modelLoc, glm::value_ptr(modelMatrix));
+
+    // Страховка от пустой modelMatrix
+    if (modelMatrix == glm::mat4(0.0f)) goto THE_END;
 
     // 3. WORLD TO SCREEN ЧЕРЕЗ glm::vec4
     glm::vec4 objPos = modelMatrix * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -62,8 +63,10 @@ void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, co
     float screenX = (ndc.x + 1.0f) / 2.0f * options::monitorX;
     float screenY = (1.0f - ndc.y) / 2.0f * options::monitorY;
 
-    // 4. КОПИМ В МАССИВ (отправка — один раз за кадр из hk_glFlush)
-    coordsArray.push_back({ screenX, screenY });
+    // 4. КОПИМ ТОЛЬКО ТОЧКИ В ПРЕДЕЛАХ ЭКРАНА
+    if (screenX >= 0 && screenX <= options::monitorX && screenY >= 0 && screenY <= options::monitorY) {
+        coordsArray.push_back({ screenX, screenY });
+    }
 
 THE_END:
     fn_glDrawElements(mode, count, type, indices);
@@ -78,49 +81,3 @@ void WINAPI Hooks::hk_glFlush() {
 
     fn_glFlush();
 }
-```
-
----
-
-## Претензии к этому коду (по делу, до того как ты побежишь инжектить)
-
-### 1. `glGetBufferSubData(GL_UNIFORM_BUFFER, 0, ...)` читает **не тот** UBO
-Это самая большая проблема. В оригинале UBO создавался явно, привязывался, и через `glUniformBlockBinding` шейдеру говорилось «смотри в этот блок». Только после этого `glGetBufferSubData` читал осмысленные `view`/`projection`. В твоём варианте ты читаешь **тот UBO, который сейчас привязан к `GL_UNIFORM_BUFFER`** — а привязан там может быть что угодно (буфер света, буфер материала, `persistentBlock` из другого шейдера). Ты получишь мусор. Либо верни ручное создание UBO как в оригинале, либо читай `viewMatrix`/`projectionMatrix` через `glGetUniformLocation(currentProgram, "viewMatrix")` и `glGetUniformfv` — так же, как ты делаешь с `modelMatrix`.
-
-### 2. `glGetBufferSubData` без проверки размера — прямой путь к GL_INVALID_OPERATION
-Если привязанный UBO меньше `2 * sizeof(glm::mat4) = 128` байт, `glGetBufferSubData` вернёт ошибку, а `viewMatrix`/`projectionMatrix` останутся нулями (ты их инициализируешь `{0}`). Дальше `clipSpace.w == 0` → отсечётся по `clipSpace.w <= 0.01f`, но ты просто потеряешь весь кадр и не поймёшь почему. Проверь `GL_UNIFORM_BUFFER_SIZE` перед чтением.
-
-### 3. `glGetBufferSubData` читает из **того, что привязано в момент вызова**, а не в момент draw call
-Между хуком и фактическим `fn_glDrawElements` игра может переключить биндинг. Всё, что ты прочитал, — это состояние на момент твоего хука, не на момент реальной отрисовки. Обычно совпадает, но не гарантированно.
-
-### 4. Нет проверки на вырожденные матрицы
-`viewMatrix == 0`, `projectionMatrix == 0`, `modelMatrix == 0` — все три варианта возможны при чтении мусора из UBO. Ты просто получишь `clipSpace = 0`, `w = 0`, отсечёшь по `w <= 0.01f`. То есть тихо потеряешь игроков вместо явной ошибки. Оригинал проверял `projectionMatrix[3][3] != 0.0f` — сделай так же.
-
-### 5. `modelMatrix * vec4(0,0,0,1)` — это позиция объекта, но **не голова**
-Оригинал делал `worldPos.y += 1.65f` для аимбота (по комментарию автора). Ты этого не делаешь — координата будет «в ногах» модели. Для ESP-боксов норм, для аимбота — промах на 1.65 метра вверх. Если цель — рисовать точки на телах, верни `objPos.y += 1.65f` после `modelMatrix * vec4(0,0,0,1)`.
-
-### 6. Нет проверки, что точка на экране
-Оригинал резал `screenX < monitorX && screenX > 0 && screenY > 0 && screenY < monitorY`. У тебя этого нет — точки за камерой (с положительным `w`, что бывает при определённых матрицах) или за пределами экрана будут улетать в `coordsArray` и в оверлей, где ты их будешь рисовать за краем. Добавь проверку, если не хочешь сюрпризов.
-
-### 7. `glewInit()` вызывается из хука, который сам может быть вызван до создания GL-контекста
-В оригинале так же, но это не значит, что правильно. Если `hk_glDrawElements` дёрнется до того, как игра создаст контекст, `glewInit()` вернёт ошибку и ты увидишь MessageBox. Правильнее — инициализировать GLEW после `wglMakeCurrent` / в `hk_wglSwapBuffers`, а не в `glDrawElements`. Пока оставил как в оригинале — но это грабли.
-
-### 8. `getPositionFromMatrix` теперь мёртвый код
-Нигде не вызывается (мы заменили на `modelMatrix * vec4(0,0,0,1)`). Компилятор может выдать warning, а может и молча оставить — в любом случае мусор. Удаляй.
-
-### 9. Барьер `count < 1000 || count > 150000` — магия, проверяй на игре
-Это порог из оригинального кода, но он не «отсекает мусор» магически. Модель игрока в разных скинах и LOD'ах может давать разный `count`. Если у тебя не рисуются какие-то игроки — снижай `1000`. Если рисуется трава — поднимай. Никакой гарантии, что эти числа актуальны для твоей версии Сталзона.
-
-### 10. `hk_glFlush` может вызываться не раз в кадр
-Ты полагаешься на то, что `glFlush` — это конец кадра. В реальности игра может вызывать `glFlush` несколько раз или, наоборот, использовать `glFinish` / `SwapBuffers` без `glFlush`. Если хочешь гарантированно раз в кадр — вешай отправку на `wglSwapBuffers`, а не на `glFlush`. Иначе получишь либо несколько пакетов за кадр, либо ни одного.
-
-### 11. `writeEntitiesToShared` не проверяет, инициализирован ли сокет
-Если `connectSocket == INVALID_SOCKET` (сокет не поднялся, сервер не запущен), функция тихо ничего не сделает. Всё ок, но при отладке ты не поймёшь, почему оверлей пустой. Добавь лог раз в N секунд.
-
-### 12. `options::monitorX/Y` не проверяются
-Если они нулевые (не проинициализированы), `screenX`/`screenY` будут нулями и ты насыпешь в оверлей мусор. Проверь их инициализацию до старта хука.
-
----
-
-## Итог
-Из перечисленного **критичны пункты 1, 2, 4, 6** — из-за них код, скорее всего, будет работать неправильно или не работать вообще. Остальное — качество жизни и отладка. Если хочешь, могу переписать так, чтобы читать `viewMatrix`/`projectionMatrix` через `glGetUniformLocation` (как `modelMatrix`) — это устранит пункты 1, 2, 3 сразу, и останется только проверить, что шейдер игры реально хранит их в uniform'ах, а не в UBO.
