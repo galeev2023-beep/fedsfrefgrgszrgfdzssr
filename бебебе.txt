@@ -1,166 +1,92 @@
-#include <Windows.h>
-#include <string>
-#include <iostream>
-#include "GL/glew.h"
-#include "options.h"
-#pragma comment(lib, "glew32s.lib")
-#include "hooks.h"
 #include "sharedMemory.h"
-#include <GL/gl.h>
-#pragma comment(lib, "OpenGL32.lib")
-#include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
-#include <algorithm>
+#include <Windows.h>
+#include <iostream>
+#include <vector>
+#include <WinSock2.h>
+#include <WS2tcpip.h>
 
-std::vector<std::pair<float, float>> coordsArray;
+#pragma comment(lib, "ws2_32.lib")
 
-void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+LPVOID pBuf = nullptr;
+HANDLE hMapFile = nullptr;
+SOCKET connectSocket = INVALID_SOCKET;
 
-    static bool glewInitialized = false;
-
-    if (!glewInitialized) {
-        if (glewInit() != GLEW_OK) {
-            MessageBoxA(NULL, "Failed to activate GLEW", "Error", MB_ICONERROR);
-        }
-        glewInitialized = true;
+bool createMappingData() {
+    // --- Winsock init ---
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        //std::cerr << "[-] WSAStartup failed!" << std::endl;
+        return false;
     }
 
-    // --- 1. Фильтр полигонов ---
-    // Модели игроков и крупных энтити — count в районе 1000..150000.
-    // Трава, листья, декали — меньше. mode == 4 — это GL_TRIANGLES.
-    bool isReady = (count >= 1000 && count <= 150000) && (mode == 4);
-
-    GLint currentProgram = 0;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
-
-    if (isReady) {
-        glm::mat4 modelMatrix{ 0 };
-        glm::mat4 viewMatrix{ 0 };
-        glm::mat4 projectionMatrix{ 0 };
-
-        bool gotModelMatrix = false;
-        bool gotViewProjection = false;
-
-        // --- 2. modelMatrix через юниформ ---
-        if (currentProgram != 0) {
-            GLint modelMatrixLocation = glGetUniformLocation(currentProgram, "modelMatrix");
-            if (modelMatrixLocation != -1) {
-                glGetUniformfv(currentProgram, modelMatrixLocation, glm::value_ptr(modelMatrix));
-                gotModelMatrix = true;
-            }
-        }
-
-        // --- 3. viewMatrix / projectionMatrix через UBO ---
-        // Основной путь для шейдерного пайплайна Сталзона.
-        if (currentProgram != 0) {
-            GLuint blockIndexPersist = glGetUniformBlockIndex(currentProgram, "persistentBlock");
-            if (blockIndexPersist != GL_INVALID_INDEX) {
-                GLint bindingPoint = 0;
-                glGetActiveUniformBlockiv(currentProgram, blockIndexPersist,
-                                          GL_UNIFORM_BLOCK_BINDING, &bindingPoint);
-
-                GLint gameUbo = 0;
-                glGetIntegeri_v(GL_UNIFORM_BUFFER_BINDING, bindingPoint, &gameUbo);
-
-                if (gameUbo != 0) {
-                    // Сохраняем текущую привязку, чтобы вернуть её после чтения.
-                    GLint previousUBO = 0;
-                    glGetIntegerv(GL_UNIFORM_BUFFER_BINDING, &previousUBO);
-
-                    glBindBuffer(GL_UNIFORM_BUFFER, gameUbo);
-                    glGetBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(glm::mat4),
-                                       glm::value_ptr(viewMatrix));
-                    glGetBufferSubData(GL_UNIFORM_BUFFER, sizeof(glm::mat4), sizeof(glm::mat4),
-                                       glm::value_ptr(projectionMatrix));
-                    glBindBuffer(GL_UNIFORM_BUFFER, previousUBO);
-
-                    // Если UBO реально вернул ненулевые матрицы — считаем успех.
-                    if (viewMatrix != glm::mat4(0.0f) && projectionMatrix != glm::mat4(0.0f)) {
-                        gotViewProjection = true;
-                    }
-                }
-            }
-        }
-
-        // --- 4. Fallback через glGetFloatv ---
-        // Если UBO не сработал — пробуем fixed-function стек.
-        // На чисто шейдерном пайплайне вернёт identity, и мы отсеем по identity-проверке.
-        if (!gotViewProjection) {
-            GLfloat mvRaw[16] = { 0 };
-            GLfloat pjRaw[16] = { 0 };
-            glGetFloatv(GL_MODELVIEW_MATRIX, mvRaw);
-            glGetFloatv(GL_PROJECTION_MATRIX, pjRaw);
-
-            glm::mat4 mv = glm::make_mat4(mvRaw);
-            glm::mat4 pj = glm::make_mat4(pjRaw);
-
-            if (mv != glm::mat4(0.0f) && pj != glm::mat4(0.0f) &&
-                mv != glm::mat4(1.0f) && pj != glm::mat4(1.0f)) {
-                viewMatrix = mv;
-                projectionMatrix = pj;
-                gotViewProjection = true;
-                // modelMatrix отсутствует в этом пути — используем identity,
-                // потому что GL_MODELVIEW_MATRIX уже содержит view * model.
-                if (!gotModelMatrix) {
-                    modelMatrix = glm::mat4(1.0f);
-                    gotModelMatrix = true;
-                }
-            }
-        }
-
-        if (!gotModelMatrix || !gotViewProjection) {
-            goto THE_END;
-        }
-
-        // --- 5. Санити-проверки ---
-        // Убрали projectionMatrix[3][3] != 0.0f — она ломала всё на Reversed-Z
-        // и Ortho-проекциях (в современном Сталзоне там 1.0).
-        if (modelMatrix == glm::mat4(0.0f) ||
-            viewMatrix == glm::mat4(0.0f) ||
-            projectionMatrix == glm::mat4(0.0f)) {
-            goto THE_END;
-        }
-
-        // --- 6. Расчёт экранных координат ---
-        glm::vec4 worldPos = glm::vec4(modelMatrix[3][0],
-                                       modelMatrix[3][1],
-                                       modelMatrix[3][2],
-                                       modelMatrix[3][3]);
-
-        // Если modelMatrix == identity (fallback-путь), worldPos = (0,0,0,1).
-        // Это даст точку в центре камеры, что для шейдерного пайплайна неверно,
-        // но fallback и не должен срабатывать в норме. Оставлено как страховка.
-        float headHeight = 1.65f; // points at the legs, so I decided to lift it for aimbot
-        worldPos.y += headHeight;
-
-        glm::vec4 viewPosition = viewMatrix * worldPos;
-        glm::vec4 clipPosition = projectionMatrix * viewPosition;
-
-        if (clipPosition.w == 0.0f) goto THE_END;
-
-        glm::vec4 ndcPosition = clipPosition / clipPosition.w;
-
-        float screenX = (ndcPosition.x + 1.0f) / 2.0f * options::monitorX;
-        float screenY = (1.0f - ndcPosition.y) / 2.0f * options::monitorY;
-
-        if (screenX < options::monitorX && screenX > 0.0f &&
-            screenY > 0.0f && screenY < options::monitorY) {
-            coordsArray.push_back({ screenX, screenY });
-        }
+    connectSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (connectSocket == INVALID_SOCKET) {
+        //std::cerr << "[-] Failed to create socket!" << std::endl;
+        WSACleanup();
+        return false;
     }
 
-THE_END:
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(28015);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
 
-    fn_glDrawElements(mode, count, type, indices);
+    if (connect(connectSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        //std::cerr << "[-] connect() failed!" << std::endl;
+        closesocket(connectSocket);
+        connectSocket = INVALID_SOCKET;
+        WSACleanup();
+        return false;
+    }
+
+    // --- Shared memory ---
+    hMapFile = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(CoordData), L"Global\\Virelex");
+    if (hMapFile == NULL) {
+        //std::cerr << "[-] Failed to create file mapping object!" << std::endl;
+        return false;
+    }
+
+    pBuf = MapViewOfFile(hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(CoordData));
+    if (pBuf == NULL) {
+        //std::cerr << "[-] Failed to map view of file!" << std::endl;
+        return false;
+    }
+
+    shared::sharedData = (CoordData*)pBuf;
+
+    return true;
 }
 
-void WINAPI Hooks::hk_glFlush() {
+void closeMappingHandle() {
+    UnmapViewOfFile(pBuf);
+    CloseHandle(hMapFile);
 
-    if (!coordsArray.empty()) {
-        writeEntitiesToShared(coordsArray, coordsArray.size());
-        coordsArray.clear();
+    if (connectSocket != INVALID_SOCKET) {
+        closesocket(connectSocket);
+        connectSocket = INVALID_SOCKET;
+    }
+    WSACleanup();
+}
+
+void writeEntitiesToShared(const std::vector<std::pair<float, float>>& entities, const int count) {
+    int safeCount = count;
+    if (safeCount > 5000) safeCount = 5000;
+    if (safeCount < 0) safeCount = 0;
+
+    shared::sharedData->count = safeCount;
+
+    for (int i = 0; i < safeCount; i++) {
+        shared::sharedData->entities[i] = entities[i];
     }
 
-    fn_glFlush();
+    // Build packet and send over TCP
+    CoordData packet{};
+    packet.count = safeCount;
+    for (int i = 0; i < safeCount; i++) {
+        packet.entities[i] = entities[i];
+    }
+
+    if (connectSocket != INVALID_SOCKET) {
+        send(connectSocket, (char*)&packet, sizeof(CoordData), 0);
+    }
 }
