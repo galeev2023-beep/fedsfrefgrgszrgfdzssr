@@ -1,0 +1,65 @@
+#include "sharedMemory.h"
+#include <Windows.h>
+#include <iostream>
+#include <vector>
+#include <WinSock2.h>
+#include <WS2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib")
+
+SOCKET connectSocket = INVALID_SOCKET;
+
+bool createMappingData() {
+    // --- Winsock init ---
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        //std::cerr << "[-] WSAStartup failed!" << std::endl;
+        return false;
+    }
+
+    connectSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (connectSocket == INVALID_SOCKET) {
+        //std::cerr << "[-] Failed to create socket!" << std::endl;
+        WSACleanup();
+        return false;
+    }
+
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(28015);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+
+    if (connect(connectSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        //std::cerr << "[-] connect() failed!" << std::endl;
+        closesocket(connectSocket);
+        connectSocket = INVALID_SOCKET;
+        WSACleanup();
+        return false;
+    }
+
+    return true;
+}
+
+void closeMappingHandle() {
+    if (connectSocket != INVALID_SOCKET) {
+        closesocket(connectSocket);
+        connectSocket = INVALID_SOCKET;
+    }
+    WSACleanup();
+}
+
+void writeEntitiesToShared(const std::vector<std::pair<float, float>>& entities, const int count) {
+    int safeCount = (count > MAX_ENTITIES) ? MAX_ENTITIES : count;
+    if (safeCount < 0) safeCount = 0;
+
+    CoordData packet{};
+    packet.count = safeCount;
+
+    for (int i = 0; i < safeCount; i++) {
+        packet.entities[i] = entities[i];
+    }
+
+    if (connectSocket != INVALID_SOCKET) {
+        send(connectSocket, (char*)&packet, sizeof(CoordData), 0);
+    }
+}
