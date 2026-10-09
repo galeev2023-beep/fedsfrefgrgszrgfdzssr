@@ -1,83 +1,113 @@
-#include <Windows.h>
-#include <string>
-#include <iostream>
-#include "GL/glew.h"
-#include "options.h"
-#pragma comment(lib, "glew32s.lib")
-#include "hooks.h"
 #include "sharedMemory.h"
-#include <GL/gl.h>
-#pragma comment(lib, "OpenGL32.lib")
-#include <glm/glm.hpp>
-#include <glm/gtc/matrix_transform.hpp>
-#include <glm/gtc/type_ptr.hpp>
-#include <algorithm>
+#include <Windows.h>
+#include <iostream>
+#include <vector>
 
-std::vector<std::pair<float, float>> coordsArray;
+// Теперь это не хендл маппинга, а хендл канала. Имя переменной оставил
+// прежним, чтобы не ломать те места, где она могла упоминаться.
+HANDLE hPipe = nullptr;
 
-void WINAPI Hooks::hk_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+// Локальный пакет под отправку. Статический — чтобы не аллоцировать 40 КБ
+// на каждый кадр. Живёт в .bss, инициализируется нулями один раз.
+static CoordData packet;
 
-    static bool glewInitialized = false;
-    if (!glewInitialized) {
-        if (glewInit() != GLEW_OK) {
-            MessageBoxA(NULL, "Failed to activate GLEW", "Error", MB_ICONERROR);
+bool createMappingData() {
+    // Оверлей-сервер мог ещё не подняться — ждём его появления.
+    // До ~10 секунд (100 попыток × 100 мс) с паузой между ними.
+    const int maxAttempts = 100;
+
+    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+        hPipe = CreateFile(
+            L"\\\\.\\pipe\\VirelexPipe",   // тот же путь, что и в CreateNamedPipe
+            GENERIC_WRITE,                 // клиент только пишет
+            0,                             // без шаринга
+            NULL,
+            OPEN_EXISTING,                 // открываем существующий канал
+            0,
+            NULL
+        );
+
+        if (hPipe != INVALID_HANDLE_VALUE) {
+            break;
         }
-        glewInitialized = true;
+
+        DWORD err = GetLastError();
+
+        // ERROR_PIPE_BUSY — сервер занят другим клиентом, ждём.
+        // ERROR_FILE_NOT_FOUND — сервер ещё не создал канал, тоже ждём.
+        if (err != ERROR_PIPE_BUSY && err != ERROR_FILE_NOT_FOUND) {
+            std::cerr << "[-] CreateFile pipe failed, code: " << err << "\n";
+            return false;
+        }
+
+        // Если канал занят — можно подождать его освобождения через WaitNamedPipe,
+        // но простой Sleep тоже работает и не блокирует на неопределённый срок.
+        Sleep(100);
     }
 
-    // 1. БРОНЕБОЙНЫЙ БАРЬЕР ПОЛИГОНОВ
-    if (count < 1000 || count > 150000 || mode != 4) goto THE_END;
-
-    // 2. ЗАБОР МАТРИЦ ИЗ ШЕЙДЕРА
-    GLint currentProgram;
-    glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
-    if (currentProgram <= 0) goto THE_END;
-
-    glm::mat4 viewMatrix{ 0 };
-    glm::mat4 projectionMatrix{ 0 };
-    glm::mat4 modelMatrix{ 0 };
-
-    GLint viewLoc = glGetUniformLocation(currentProgram, "viewMatrix");
-    GLint projLoc = glGetUniformLocation(currentProgram, "projectionMatrix");
-    if (viewLoc != -1) glGetUniformfv(currentProgram, viewLoc, glm::value_ptr(viewMatrix));
-    if (projLoc != -1) glGetUniformfv(currentProgram, projLoc, glm::value_ptr(projectionMatrix));
-
-    // Отсекаем мусорный рендер с пустыми матрицами
-    if (projectionMatrix == glm::mat4(0.0f) || viewMatrix == glm::mat4(0.0f)) goto THE_END;
-
-    GLint modelLoc = glGetUniformLocation(currentProgram, "modelMatrix");
-    if (modelLoc == -1) goto THE_END;
-    glGetUniformfv(currentProgram, modelLoc, glm::value_ptr(modelMatrix));
-
-    // Страховка от пустой modelMatrix
-    if (modelMatrix == glm::mat4(0.0f)) goto THE_END;
-
-    // 3. WORLD TO SCREEN ЧЕРЕЗ glm::vec4
-    glm::vec4 objPos = modelMatrix * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-    glm::vec4 clipSpace = projectionMatrix * viewMatrix * objPos;
-
-    if (clipSpace.w <= 0.01f) goto THE_END;
-
-    glm::vec3 ndc = glm::vec3(clipSpace) / clipSpace.w;
-
-    float screenX = (ndc.x + 1.0f) / 2.0f * options::monitorX;
-    float screenY = (1.0f - ndc.y) / 2.0f * options::monitorY;
-
-    // 4. КОПИМ ТОЛЬКО ТОЧКИ В ПРЕДЕЛАХ ЭКРАНА
-    if (screenX >= 0 && screenX <= options::monitorX && screenY >= 0 && screenY <= options::monitorY) {
-        coordsArray.push_back({ screenX, screenY });
+    if (hPipe == INVALID_HANDLE_VALUE || hPipe == nullptr) {
+        std::cerr << "[-] Named pipe not available after retries.\n";
+        hPipe = nullptr;
+        return false;
     }
 
-THE_END:
-    fn_glDrawElements(mode, count, type, indices);
+    // Переводим канал в блокирующий режим: WriteFile будет ждать, пока сервер
+    // освободит буфер, а не возвращать ERROR_NO_DATA на каждом кадре.
+    DWORD mode = PIPE_WAIT;
+    if (!SetNamedPipeHandleState(hPipe, &mode, NULL, NULL)) {
+        std::cerr << "[-] SetNamedPipeHandleState failed: " << GetLastError() << "\n";
+        // Не критично: канал всё равно работает, просто возможны срывы при пиковой нагрузке.
+    }
+
+    std::cout << "[+] Connected to overlay pipe.\n";
+    return true;
 }
 
-void WINAPI Hooks::hk_glFlush() {
+void closeMappingHandle() {
+    if (hPipe && hPipe != INVALID_HANDLE_VALUE) {
+        // Flush не нужен: WriteFile на канале синхронный, данные уже ушли.
+        CloseHandle(hPipe);
+        hPipe = nullptr;
+    }
+}
 
-    if (!coordsArray.empty()) {
-        writeEntitiesToShared(coordsArray, coordsArray.size());
-        coordsArray.clear();
+void writeEntitiesToShared(const std::vector<std::pair<float, float>>& entities, const int count) {
+    if (!hPipe || hPipe == INVALID_HANDLE_VALUE) {
+        return;
     }
 
-    fn_glFlush();
+    // Защита от переполнения: режем до MAX_ENTITIES, иначе вылезем за границы
+    // массива packet.entities и получим порчу стека/краш.
+    int safeCount = (count > MAX_ENTITIES) ? MAX_ENTITIES : count;
+
+    packet.count = safeCount;
+
+    for (int i = 0; i < safeCount; ++i) {
+        packet.entities[i] = entities[i];
+    }
+
+    DWORD bytesWritten = 0;
+    BOOL ok = WriteFile(
+        hPipe,
+        &packet,
+        sizeof(CoordData),
+        &bytesWritten,
+        NULL
+    );
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        std::cerr << "[-] WriteFile to pipe failed, code: " << err << "\n";
+
+        // Канал порвался (оверлей закрылся, перезапустился, упал).
+        // Закрываем хендл — следующая инициализация попробует подключиться заново.
+        CloseHandle(hPipe);
+        hPipe = nullptr;
+    }
+    else if (bytesWritten != sizeof(CoordData)) {
+        // Частичная запись. Для PIPE_TYPE_BYTE это ненормально и означает,
+        // что канал перешёл в message-режим или был закрыт на середине.
+        std::cerr << "[-] Partial write: " << bytesWritten
+            << " of " << sizeof(CoordData) << "\n";
+    }
 }
