@@ -1,3 +1,18 @@
+Тут получилась путаница из-за того, что часть твоих пунктов уже сделана в текущем файле, а один пункт при прямом исполнении сломает ImGui. Давай по порядку.
+
+Что уже так, как ты просишь
+Пункт 1 — hwnd = ::CreateWindowExW(WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED, ...) уже стоит с тремя флагами. Менять нечего. В твоём исходнике на строке 14 уже так.
+
+Что надо поменять (и что не так с формулировкой)
+Пункт 2 — в файле стоит SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_ALPHA). Ты просишь заменить на 255, LWA_ALPHA — это правильный фикс, я его делаю.
+
+Пункт 3 — глобал bool menuOpen = true; добавляю.
+
+Пункт 4 — тут главная проблема: твой сниппет для MakeNewFrame убирает вызовы ImGui_ImplDX11_NewFrame(), ImGui_ImplWin32_NewFrame() и ImGui::NewFrame(). Если ты просто вставишь новый MakeNewFrame вместо старого — ImGui не будет рисоваться вообще (краш или пустой экран). Плюс если ты «просто вставишь функцию в конец файла» — получишь ODR-нарушение, две Overlay::MakeNewFrame(). Поэтому я заменяю тело существующей MakeNewFrame, добавляя логику тумблера, но сохраняя вызовы ImGui.
+
+Вот полный файл:
+
+cpp
 #include <d3d11.h>
 #include <iostream>
 #include <Windows.h>
@@ -8,13 +23,15 @@
 
 LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+bool menuOpen = true;
+
 bool Overlay::CreateOverlay()
 {
     wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"ImGui Example", nullptr };
     ::RegisterClassExW(&wc);
     hwnd = ::CreateWindowExW(WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_LAYERED, wc.lpszClassName, L"DjdasdaDH", WS_POPUP, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), nullptr, nullptr, wc.hInstance, nullptr);
 
-    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_ALPHA);
+    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 255, LWA_ALPHA);
     MARGINS margin = { -1 };
     DwmExtendFrameIntoClientArea(hwnd, &margin);
 
@@ -37,6 +54,20 @@ void Overlay::imguiInit() {
 }
 
 void Overlay::MakeNewFrame() {
+    // Переключатель меню по Insert (edge-triggered)
+    if (GetAsyncKeyState(VK_INSERT) & 1) menuOpen = !menuOpen;
+
+    // Динамическое управление сквозным кликом
+    LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (!menuOpen) {
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TRANSPARENT);
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouse;
+    } else {
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle & ~WS_EX_TRANSPARENT);
+        ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+    }
+
+    // Оригинальные вызовы ImGui, которые нельзя терять
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -141,3 +172,58 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
     return ::DefWindowProcW(hWnd, msg, wParam, lParam);
 }
+Претензии к получившемуся коду
+1. SetLayeredWindowAttributes(..., 255, LWA_ALPHA) может сделать оверлей полностью непрозрачным
+У тебя окно создано с WS_EX_LAYERED + DwmExtendFrameIntoClientArea(margin = {-1}). Это стандартная ImGui-схема: DWM композитит клиентскую область и берёт попиксельную альфу из D3D-рендер-таргета (clear_color_with_alpha = (0,0,0,0) → фон прозрачный, ImGui-элементы полупрозрачные). Но SetLayeredWindowAttributes с bAlpha = 255 говорит системе: «ко всему окну применять глобальную альфу 255», что может перебить попиксельную альфу DWM, и ты получишь чёрный прямоугольник на весь экран вместо прозрачного оверлея.
+
+Правило на практике:
+
+Если используешь DwmExtendFrameIntoClientArea — не вызывай SetLayeredWindowAttributes вообще. DWM сам разберётся.
+
+Если хочешь через SetLayeredWindowAttributes — используй LWA_COLORKEY с ключевым цветом, но тогда ты теряешь полупрозрачность ImGui-элементов (всё или полностью прозрачно, или полностью видно).
+
+bAlpha = 0 (как в исходнике) обычно делают только в паре с colorkey или когда альфа-канал не важен.
+
+Совет: закомментируй SetLayeredWindowAttributes целиком и проверь, рисуется ли прозрачный оверлей. Если да — оставь закомментированным. Если нет — попробуй LWA_ALPHA с 255, но знай про риск. Если не заработает ни так, ни так — снимите с DwmExtendFrameIntoClientArea вместе.
+
+2. SetWindowLongPtr(GWL_EXSTYLE, ...) каждый кадр — лишние syscalls
+Ты вызываешь SetWindowLongPtr 60+ раз в секунду, даже когда menuOpen не менялся. Каждый вызов — переход в ядро + пересчёт стилей окна + потенциальный WM_STYLECHANGING/CHANGED. Лучше кешировать предыдущее состояние и менять только при переключении:
+
+cpp
+static bool lastMenuOpen = menuOpen;
+if (lastMenuOpen != menuOpen) {
+    LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (!menuOpen) {
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TRANSPARENT);
+        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouse;
+    } else {
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle & ~WS_EX_TRANSPARENT);
+        ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NoMouse;
+    }
+    lastMenuOpen = menuOpen;
+}
+Плюс — на каждый SetWindowLongPtr для GWL_EXSTYLE система требует SetWindowPos с SWP_FRAMECHANGED, иначе изменения могут не примениться немедленно. У тебя этого нет. Обычно работает и без, но если увидишь, что клики не пробрасываются/не перехватываются сразу — добавь SetWindowPos(hwnd, nullptr, 0,0,0,0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED); после SetWindowLongPtr.
+
+3. GetAsyncKeyState(VK_INSERT) & 1 — глобальный хук, но edge-triggered
+GetAsyncKeyState возвращает бит 0 в младшем бите, если клавиша была нажата с момента последнего вызова — это глобально, независимо от фокуса. То есть Insert будет переключать меню, даже когда игра в фокусе. Это то, что тебе нужно. Но если у тебя где-то ещё в проекте вызывается GetAsyncKeyState(VK_INSERT), они съедят edge друг у друга — бит сбрасывается при чтении. Следи, чтобы Insert читался только в одном месте.
+
+4. ImGuiConfigFlags_NoMouse дублирует WS_EX_TRANSPARENT
+Эти две вещи делают почти одно и то же: WS_EX_TRANSPARENT не даёт окну получать мышь от системы, ImGuiConfigFlags_NoMouse заставляет ImGui игнорировать события. Дубляж не вредит, но если ты уберёшь один из механизмов и оставишь другой — результат тот же. Никаких претензий, просто к сведению.
+
+5. Прозрачность окна и WS_EX_TRANSPARENT — не одно и то же
+Ты путаешь два разных WS_EX_TRANSPARENT-эффекта. Флаг делает окно «сквозным для мыши» (mouse passthrough), но не делает его прозрачным визуально. Визуальная прозрачность у тебя — от WS_EX_LAYERED + SetLayeredWindowAttributes или от DWM. Это работает, но если кто-то читает код и думает «TRANSPARENT = прозрачный» — он ошибается. Оставь комментарий в коде.
+
+6. CreateWindowExW использует GetSystemMetrics(SM_CXSCREEN), а не виртуальный рабочий стол
+Если у тебя несколько мониторов или игра в полноэкранном режиме не на основном мониторе — оверлей будет не там. Для мультимонитора используй GetSystemMetrics(SM_XVIRTUALSCREEN) / SM_CXVIRTUALSCREEN. Для игры в окне на втором мониторе — бери rect окна игры через GetWindowRect(GetForegroundWindow(), ...). Сейчас у тебя оверлей всегда на основном мониторе.
+
+7. g_ResizeWidth / g_ResizeHeight пишутся, но в MakeNewFrame не обрабатываются
+В WndProc ты ловишь WM_SIZE и сохраняешь размеры, но нигде не вызываешь g_pSwapChain->ResizeBuffers(...) и не пересоздаёшь g_mainRenderTargetView. Для topmost-оверлея на весь экран это не критично (размер не меняется), но если игра переключится в другое разрешение или пользователь свернёт/развернёт — получишь мусор. Мёртвый код, либо дорабатывай, либо удаляй.
+
+8. Present(1, 0) — жёсткий vsync на 60 Гц
+Present(1, 0) включает vsync с интервалом 1. Оверлей будет рендериться ровно 60 FPS вне зависимости от FPS игры. Если игра идёт на 144 Гц, ты будешь рассинхронизирован — точки будут «плавать» относительно моделей. Для оверлея на 144 Гц-мониторе лучше Present(0, 0) (без vsync) или синхронизировать с игрой через wglSwapBuffers хук. Не баг, но заметно.
+
+9. clear_color_with_alpha не показан
+У тебя в RenderGui используется clear_color_with_alpha, но он не в этом файле. Скорее всего в overlay.h. Убедись, что там { 0.0f, 0.0f, 0.0f, 0.0f } — если альфа не 0, прозрачности не будет, и LWA_ALPHA=255 усугубит это.
+
+10. bool menuOpen — глобал в .cpp, а не в классе
+Формально работает, но если у тебя где-то ещё есть menuOpen (например, в overlay.h как член класса), получишь shadowing. Проверь по проекту. Если это член класса Overlay — перенеси в overlay.h как bool menuOpen = true; в определении класса, а из .cpp убери.
